@@ -3,17 +3,22 @@ const admin = require('firebase-admin');
 let serviceAccount;
 
 try {
-  serviceAccount = require('./serviceAccountKey.json');
-} catch (e) {
-  console.error('❌ Cannot load serviceAccountKey.json:', e.message);
-  process.exit(1);
-}
+  if (process.env.FIREBASE_KEY) {
+    // ✅ Railway / Production
+    serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
+    console.log('🌐 Using FIREBASE_KEY from environment');
+  } else {
+    // ✅ Local development
+    serviceAccount = require('./serviceAccountKey.json');
+    console.log('💻 Using local serviceAccountKey.json');
+  }
 
-try {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
+
   console.log('✅ Firebase Admin initialized');
+
 } catch (e) {
   console.error('❌ Firebase init failed:', e.message);
   process.exit(1);

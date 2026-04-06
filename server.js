@@ -609,7 +609,7 @@ app.get("/match-history/:uid", verifyToken, async (req, res) => {
 });
 
 // ===============================
-const PORT = process.env.PORT || 4000;
+const PORT = process.env.PORT;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Duelix backend running on port ${PORT}`);
 });

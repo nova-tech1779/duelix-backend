@@ -36,6 +36,13 @@ app.get("/health", (req, res) => {
 });
 
 // ===============================
+// 🔥 ROOT ROUTE (IMPORTANT FOR RAILWAY)
+// ===============================
+app.get("/", (req, res) => {
+  res.send("Duelix backend is live 🚀");
+});
+
+// ===============================
 // 🔥 AUTH SYSTEM
 // ===============================
 

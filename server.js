@@ -603,10 +603,10 @@ app.get("/match-history/:uid", verifyToken, async (req, res) => {
 
 // ===============================
 const PORT = process.env.PORT || 4000;
-const server = app.listen(PORT, '0.0.0.0', () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Duelix backend running on port ${PORT}`);
 });
 
-server.on('error', (err) => {
-  console.error('❌ Server error:', err);
+server.on("error", (err) => {
+  console.error("❌ Server error:", err);
 });

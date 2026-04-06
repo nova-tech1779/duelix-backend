@@ -3,24 +3,27 @@ const admin = require('firebase-admin');
 let serviceAccount;
 
 try {
-  if (process.env.FIREBASE_KEY) {
-    // ✅ Railway / Production
-    serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-    console.log('🌐 Using FIREBASE_KEY from environment');
-  } else {
-    // ✅ Local development
-    serviceAccount = require('./serviceAccountKey.json');
-    console.log('💻 Using local serviceAccountKey.json');
+  const raw = process.env.FIREBASE_KEY;
+
+  if (!raw) {
+    throw new Error("FIREBASE_KEY is missing");
   }
+
+  serviceAccount = JSON.parse(raw);
+
+  // 🔥 THIS is the real fix
+  serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
+
+  console.log("✅ Firebase key loaded");
 
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 
-  console.log('✅ Firebase Admin initialized');
+  console.log("✅ Firebase initialized");
 
 } catch (e) {
-  console.error('❌ Firebase init failed:', e.message);
+  console.error("❌ Firebase init failed:", e.message);
   process.exit(1);
 }
 

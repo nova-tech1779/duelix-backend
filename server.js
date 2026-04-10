@@ -551,14 +551,19 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
-      const [playerA_Doc, playerB_Doc] = await Promise.all([
+      const platformRef = db.collection("platform").doc("earnings");
+      
+      // READS: All reads happen first
+      const [playerA_Doc, playerB_Doc, platformDoc] = await Promise.all([
         t.get(playerA_Ref),
         t.get(playerB_Ref),
+        t.get(platformRef),
       ]);
 
       if (!playerA_Doc.exists || !playerB_Doc.exists)
         throw new Error("Player data not found");
 
+      // WRITES: All writes happen after reads
       if (confirmedWinner === "draw") {
         t.update(playerA_Ref, {
           coins:        inc(playerA_Doc.data().coins, match.entryFee),
@@ -581,17 +586,15 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
           ? playerA_Doc : playerB_Doc;
 
         t.update(winner_Ref, {
-          coins:        inc(winner_Doc.data().coins, payout),
-          wins:         inc(winner_Doc.data().wins),
-          totalMatches: inc(winner_Doc.data().totalMatches),
+          coins:        inc(winner_Doc.data()?.coins ?? 0, payout),
+          wins:         inc(winner_Doc.data()?.wins ?? 0),
+          totalMatches: inc(winner_Doc.data()?.totalMatches ?? 0),
         });
         t.update(loser_Ref, {
-          losses:       inc(loser_Doc.data().losses),
-          totalMatches: inc(loser_Doc.data().totalMatches),
+          losses:       inc(loser_Doc.data()?.losses ?? 0),
+          totalMatches: inc(loser_Doc.data()?.totalMatches ?? 0),
         });
 
-        const platformRef = db.collection("platform").doc("earnings");
-        const platformDoc = await t.get(platformRef);
         t.set(platformRef, {
           totalCoins:  inc(
             platformDoc.exists ? platformDoc.data().totalCoins : 0,

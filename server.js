@@ -507,13 +507,17 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
 // then distributes reward atomically.
 // ─────────────────────────────────────────
 app.post("/matches/confirm-result", verifyToken, async (req, res) => {
-  const { matchId, myScore, opponentScore } = req.body;
+  const { matchId } = req.body;
   const uid = req.user.uid;
 
-  if (!matchId || myScore === undefined || opponentScore === undefined)
-    return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
+  if (!matchId)
+    return res.status(400).json({ error: "matchId required" });
 
   try {
+    let confirmedWinner;
+    let payout = 0;
+    let platform = 0;
+
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -529,18 +533,21 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
       if (!match.submittedBy)
         throw new Error("No result has been submitted yet");
       if (match.submittedBy === uid)
-        throw new Error("You submitted the result — wait for your opponent to confirm");
+        throw new Error("You submitted the result — wait for your opponent");
 
-      // Determine winner from the original submission's absolute scores
+      // ✅ Read scores from stored scoreOf (not from request body)
       const submitter      = match.submittedBy;
       const confirmer      = uid;
-      const submitterScore = match.result.scoreOf[submitter];
-      const confirmerScore = match.result.scoreOf[confirmer];
+      const scoreOf        = match.result?.scoreOf ?? {};
+      const submitterScore = scoreOf[submitter] ?? 0;
+      const confirmerScore = scoreOf[confirmer] ?? 0;
 
-      let confirmedWinner;
-      if      (submitterScore > confirmerScore) confirmedWinner = submitter;
+      if (submitterScore > confirmerScore)      confirmedWinner = submitter;
       else if (confirmerScore > submitterScore) confirmedWinner = confirmer;
       else                                      confirmedWinner = "draw";
+
+      payout   = winnerPayout(match.entryFee);
+      platform = platformCut(match.entryFee);
 
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
@@ -552,11 +559,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
       if (!playerA_Doc.exists || !playerB_Doc.exists)
         throw new Error("Player data not found");
 
-      const payout   = winnerPayout(match.entryFee);
-      const platform = platformCut(match.entryFee);
-
       if (confirmedWinner === "draw") {
-        // Refund both
         t.update(playerA_Ref, {
           coins:        inc(playerA_Doc.data().coins, match.entryFee),
           draws:        inc(playerA_Doc.data().draws),
@@ -568,44 +571,48 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
           totalMatches: inc(playerB_Doc.data().totalMatches),
         });
       } else {
-        const loser       = confirmedWinner === match.playerA ? match.playerB : match.playerA;
-        const winner_Ref   = db.collection("users").doc(confirmedWinner);
-        const loser_Ref    = db.collection("users").doc(loser);
-        const winner_Doc   = confirmedWinner === match.playerA ? playerA_Doc : playerB_Doc;
-        const loser_Doc    = loser           === match.playerA ? playerA_Doc : playerB_Doc;
+        const loser      = confirmedWinner === match.playerA
+          ? match.playerB : match.playerA;
+        const winner_Ref = db.collection("users").doc(confirmedWinner);
+        const loser_Ref  = db.collection("users").doc(loser);
+        const winner_Doc = confirmedWinner === match.playerA
+          ? playerA_Doc : playerB_Doc;
+        const loser_Doc  = loser === match.playerA
+          ? playerA_Doc : playerB_Doc;
 
-        // Pay winner
         t.update(winner_Ref, {
           coins:        inc(winner_Doc.data().coins, payout),
           wins:         inc(winner_Doc.data().wins),
           totalMatches: inc(winner_Doc.data().totalMatches),
         });
-
-        // Update loser stats (no coins — already deducted on join)
         t.update(loser_Ref, {
           losses:       inc(loser_Doc.data().losses),
           totalMatches: inc(loser_Doc.data().totalMatches),
         });
 
-        // Platform earnings
         const platformRef = db.collection("platform").doc("earnings");
         const platformDoc = await t.get(platformRef);
         t.set(platformRef, {
-          totalCoins:  inc(platformDoc.exists ? platformDoc.data().totalCoins : 0, platform),
+          totalCoins:  inc(
+            platformDoc.exists ? platformDoc.data().totalCoins : 0,
+            platform
+          ),
           lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
         }, { merge: true });
       }
+
+      // ✅ matchRef update is INSIDE the transaction now
+      t.update(matchRef, {
+        status:          "completed",
+        confirmedWinner,
+        rewarded:        true,
+        rewardPaid:      confirmedWinner === "draw" ? 0 : payout,
+        platformFee:     confirmedWinner === "draw" ? 0 : platform,
+        confirmedAt:     admin.firestore.FieldValue.serverTimestamp(),
+      });
     });
 
-    // Finalise match
-    t.update(matchRef, {
-      status:          "completed",
-      confirmedWinner,
-      rewarded:        true,
-      rewardPaid:      confirmedWinner === "draw" ? 0 : payout,
-      platformFee:     confirmedWinner === "draw" ? 0 : platform,
-      confirmedAt:     admin.firestore.FieldValue.serverTimestamp(),
-    });
+    res.json({ message: "Result confirmed", confirmedWinner });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }

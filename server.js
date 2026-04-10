@@ -452,9 +452,10 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
 
   if (!matchId || myScore === undefined || opponentScore === undefined)
     return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
-
-  if (myScore === opponentScore)
-    return res.status(400).json({ error: "Scores cannot be equal" });
+  
+//  Allow equal scores - treated as draw by confirm-result
+//  if (myScore === opponentScore)
+//     return res.status(400).json({ error: "Scores cannot be equal" });
 
   try {
     await db.runTransaction(async (t) => {

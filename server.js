@@ -100,7 +100,7 @@ app.post("/login", async (req, res) => {
 });
 
 // ⚠️  This endpoint has no auth — anyone who knows a phone number
-//     can reset that account’s password. Add verifyToken + ownership
+//     can reset that account's password. Add verifyToken + ownership
 //     check before deploying to production.
 app.post("/reset-password-direct", async (req, res) => {
   const { phone, newPassword } = req.body;
@@ -157,46 +157,46 @@ app.post("/update-name", verifyToken, async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 
 app.get("/coins/:uid", verifyToken, async (req, res) => {
-try {
-const doc = await db.collection("users").doc(req.params.uid).get();
-res.json({ coins: doc.data()?.coins ?? 0 });
-} catch (err) {
-res.status(500).json({ error: err.message });
-}
+  try {
+    const doc = await db.collection("users").doc(req.params.uid).get();
+    res.json({ coins: doc.data()?.coins ?? 0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/add-coins", verifyToken, async (req, res) => {
-const { amount } = req.body;
-if (!amount || amount <= 0)
-return res.status(400).json({ error: "Valid amount required" });
+  const { amount } = req.body;
+  if (!amount || amount <= 0)
+    return res.status(400).json({ error: "Valid amount required" });
 
-try {
-const userRef = db.collection("users").doc(req.user.uid);
-await db.runTransaction(async (t) => {
-const doc = await t.get(userRef);
-if (!doc.exists) throw new Error("User not found");
-t.update(userRef, { coins: inc(doc.data().coins, amount) });
-});
-res.json({ message: "Coins added" });
-} catch (err) {
-res.status(500).json({ error: err.message });
-}
+  try {
+    const userRef = db.collection("users").doc(req.user.uid);
+    await db.runTransaction(async (t) => {
+      const doc = await t.get(userRef);
+      if (!doc.exists) throw new Error("User not found");
+      t.update(userRef, { coins: inc(doc.data().coins, amount) });
+    });
+    res.json({ message: "Coins added" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 app.post("/reset-account", verifyToken, async (req, res) => {
-const { coins } = req.body;
-try {
-await db.collection("users").doc(req.user.uid).update({
-coins:        coins ?? 100,
-wins:         0,
-losses:       0,
-draws:        0,
-totalMatches: 0,
-});
-res.json({ message: "Account reset" });
-} catch (err) {
-res.status(500).json({ error: err.message });
-}
+  const { coins } = req.body;
+  try {
+    await db.collection("users").doc(req.user.uid).update({
+      coins:        coins ?? 100,
+      wins:         0,
+      losses:       0,
+      draws:        0,
+      totalMatches: 0,
+    });
+    res.json({ message: "Account reset" });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -204,59 +204,59 @@ res.status(500).json({ error: err.message });
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/claim-daily-reward", verifyToken, async (req, res) => {
-const uid = req.user.uid;
-let rewardData = {};
+  const uid = req.user.uid;
+  let rewardData = {};
 
-try {
-await db.runTransaction(async (t) => {
-const userRef = db.collection("users").doc(uid);
-const userDoc = await t.get(userRef);
-if (!userDoc.exists) throw new Error("User not found");
+  try {
+    await db.runTransaction(async (t) => {
+      const userRef = db.collection("users").doc(uid);
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw new Error("User not found");
 
-const user      = userDoc.data();
-const now       = new Date();
-const lastLogin = user.lastLogin?.toDate?.() ?? null;
+      const user      = userDoc.data();
+      const now       = new Date();
+      const lastLogin = user.lastLogin?.toDate?.() ?? null;
 
-if (lastLogin) {
-const sameDay =
-lastLogin.getFullYear() === now.getFullYear() &&
-lastLogin.getMonth()    === now.getMonth()    &&
-lastLogin.getDate()     === now.getDate();
-if (sameDay) throw new Error("Already claimed today");
-}
+      if (lastLogin) {
+        const sameDay =
+          lastLogin.getFullYear() === now.getFullYear() &&
+          lastLogin.getMonth()    === now.getMonth()    &&
+          lastLogin.getDate()     === now.getDate();
+        if (sameDay) throw new Error("Already claimed today");
+      }
 
-let streak = user.loginStreak ?? 0;
-if (lastLogin) {
-const yesterday = new Date(now);
-yesterday.setDate(yesterday.getDate() - 1);
-const isYesterday =
-lastLogin.getFullYear() === yesterday.getFullYear() &&
-lastLogin.getMonth()    === yesterday.getMonth()    &&
-lastLogin.getDate()     === yesterday.getDate();
-streak = isYesterday ? streak + 1 : 1;
-} else {
-streak = 1;
-}
+      let streak = user.loginStreak ?? 0;
+      if (lastLogin) {
+        const yesterday = new Date(now);
+        yesterday.setDate(yesterday.getDate() - 1);
+        const isYesterday =
+          lastLogin.getFullYear() === yesterday.getFullYear() &&
+          lastLogin.getMonth()    === yesterday.getMonth()    &&
+          lastLogin.getDate()     === yesterday.getDate();
+        streak = isYesterday ? streak + 1 : 1;
+      } else {
+        streak = 1;
+      }
 
-const coinsToAdd = streak % 7 === 0 ? 50 : 10;
+      const coinsToAdd = streak % 7 === 0 ? 50 : 10;
 
-t.update(userRef, {
-coins:       inc(user.coins, coinsToAdd),
-loginStreak: streak,
-lastLogin:   admin.firestore.FieldValue.serverTimestamp(),
-});
+      t.update(userRef, {
+        coins:       inc(user.coins, coinsToAdd),
+        loginStreak: streak,
+        lastLogin:   admin.firestore.FieldValue.serverTimestamp(),
+      });
 
-rewardData = { coinsToAdd, streak };
-});
+      rewardData = { coinsToAdd, streak };
+    });
 
-res.json({
-message:    "Daily reward claimed",
-coinsAdded: rewardData.coinsToAdd,
-streak:     rewardData.streak,
-});
-} catch (err) {
-res.status(400).json({ error: err.message });
-}
+    res.json({
+      message:    "Daily reward claimed",
+      coinsAdded: rewardData.coinsToAdd,
+      streak:     rewardData.streak,
+    });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -274,55 +274,55 @@ res.status(400).json({ error: err.message });
 // Deducts entry fee from creator atomically.
 // ─────────────────────────────────────────
 app.post("/matches/create", verifyToken, async (req, res) => {
-const { game, entryFee } = req.body;
-const uid = req.user.uid;
+  const { game, entryFee } = req.body;
+  const uid = req.user.uid;
 
-if (!game || !entryFee || entryFee <= 0)
-return res.status(400).json({ error: "game and entryFee required" });
+  if (!game || !entryFee || entryFee <= 0)
+    return res.status(400).json({ error: "game and entryFee required" });
 
-try {
-let matchId;
+  try {
+    let matchId;
 
-await db.runTransaction(async (t) => {
-const userRef = db.collection("users").doc(uid);
-const userDoc = await t.get(userRef);
-if (!userDoc.exists) throw new Error("User not found");
+    await db.runTransaction(async (t) => {
+      const userRef = db.collection("users").doc(uid);
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw new Error("User not found");
 
-const coins = userDoc.data().coins ?? 0;
-if (coins < entryFee)
-throw new Error("Insufficient coins");
+      const coins = userDoc.data().coins ?? 0;
+      if (coins < entryFee)
+        throw new Error("Insufficient coins");
 
-const matchRef = db.collection("matches").doc();
-matchId = matchRef.id;
+      const matchRef = db.collection("matches").doc();
+      matchId = matchRef.id;
 
-// Deduct entry fee
-t.update(userRef, { coins: coins - entryFee });
+      // Deduct entry fee
+      t.update(userRef, { coins: coins - entryFee });
 
-// Create match document
-t.set(matchRef, {
-id:               matchId,
-playerA:          uid,
-playerB:          null,
-game,
-entryFee,
-status:           "waiting",
-// Single-submission fields
-result:           null,
-submittedBy:      null,
-confirmedWinner:  null,
-rewarded:         false,
-createdAt:        admin.firestore.FieldValue.serverTimestamp(),
-startedAt:        null,
-});
-});
+      // Create match document
+      t.set(matchRef, {
+        id:               matchId,
+        playerA:          uid,
+        playerB:          null,
+        game,
+        entryFee,
+        status:           "waiting",
+        result:           null,
+        submittedBy:      null,
+        confirmedWinner:  null,
+        rewarded:         false,
+        createdAt:        admin.firestore.FieldValue.serverTimestamp(),
+        startedAt:        null,
+      });
+    });
 
-res.json({ matchId });
-} catch (err) {
-res.status(400).json({ error: err.message });
-}
+    res.json({ matchId });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
 });
 
 // ─────────────────────────────────────────
+// GET MATCHES
 // Returns waiting + active matches.
 // Flutter filters client-side by game/status.
 // ─────────────────────────────────────────
@@ -366,23 +366,24 @@ app.post("/matches/join", verifyToken, async (req, res) => {
       ]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
-      if (!userDoc.exists) throw new Error("User not found");
+      if (!userDoc.exists)  throw new Error("User not found");
 
       const match = matchDoc.data();
       const coins = userDoc.data().coins ?? 0;
 
-      if (match.status !== "waiting")    throw new Error("Match no longer available");
-      if (match.playerA === uid)         throw new Error("Cannot join your own match");
-      if (coins < match.entryFee)        throw new Error("Insufficient coins");
+      if (match.status !== "waiting")  throw new Error("Match no longer available");
+      if (match.playerA === uid)       throw new Error("Cannot join your own match");
+      if (coins < match.entryFee)      throw new Error("Insufficient coins");
 
       // Deduct joiner's entry fee
       t.update(userRef, { coins: coins - match.entryFee });
 
-      // Activate match
+      // Activate match — startedAt anchors both timers
       t.update(matchRef, {
-        playerB:   uid,
-        status:    "active",
-        startedAt: admin.firestore.FieldValue.serverTimestamp(),
+        playerB:        uid,
+        status:         "active",
+        startedAt:      admin.firestore.FieldValue.serverTimestamp(),
+        matchStartedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
 
@@ -441,7 +442,7 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// SUBMIT RESULT (single submission — locked)
+// SUBMIT RESULT
 // Only one player submits. If already submitted,
 // the endpoint rejects the second call.
 // The other player must then confirm or dispute.
@@ -452,10 +453,10 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
 
   if (!matchId || myScore === undefined || opponentScore === undefined)
     return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
-  
-//  Allow equal scores - treated as draw by confirm-result
-//  if (myScore === opponentScore)
-//     return res.status(400).json({ error: "Scores cannot be equal" });
+
+  // Allow equal scores - treated as draw by confirm-result
+  // if (myScore === opponentScore)
+  //   return res.status(400).json({ error: "Scores cannot be equal" });
 
   try {
     await db.runTransaction(async (t) => {
@@ -470,21 +471,21 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
         throw new Error("You are not in this match");
       if (match.status !== "active")
         throw new Error("Match is not active");
-      if (match.submittedBy)
+      if (match.submittedBy !== null) {  
         throw new Error("Result already submitted — waiting for opponent to confirm");
+      }
 
       t.update(matchRef, {
         result: {
           myScore,
           opponentScore,
-          // Store absolute scores keyed by player for backend confirm logic
           scoreOf: {
             [uid]: myScore,
             [uid === match.playerA ? match.playerB : match.playerA]: opponentScore,
           },
         },
-        submittedBy:  uid,
-        submittedAt:  admin.firestore.FieldValue.serverTimestamp(),
+        submittedBy: uid,
+        submittedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
 
@@ -497,15 +498,8 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
 // ─────────────────────────────────────────
 // CONFIRM RESULT
 // Called by the player who did NOT submit.
-// Agrees with the submitted scores → reward paid.
-// Any conflict → mark disputed instead.
-//
-// Flutter sends:
-//   { matchId, myScore, opponentScore }
-//   (mirrored from the submitter’s result)
-//
-// Backend validates the confirmer is not the submitter,
-// then distributes reward atomically.
+// Reads scores from Firestore scoreOf.
+// Distributes reward atomically.
 // ─────────────────────────────────────────
 app.post("/matches/confirm-result", verifyToken, async (req, res) => {
   const { matchId } = req.body;
@@ -535,8 +529,10 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
         throw new Error("No result has been submitted yet");
       if (match.submittedBy === uid)
         throw new Error("You submitted the result — wait for your opponent");
+      if (match.status == "completed") {
+        throw new Error("Match already completed");
+      }
 
-      // ✅ Read scores from stored scoreOf (not from request body)
       const submitter      = match.submittedBy;
       const confirmer      = uid;
       const scoreOf        = match.result?.scoreOf ?? {};
@@ -553,8 +549,8 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
       const platformRef = db.collection("platform").doc("earnings");
-      
-      // READS: All reads happen first
+
+      // READS first
       const [playerA_Doc, playerB_Doc, platformDoc] = await Promise.all([
         t.get(playerA_Ref),
         t.get(playerB_Ref),
@@ -564,15 +560,15 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
       if (!playerA_Doc.exists || !playerB_Doc.exists)
         throw new Error("Player data not found");
 
-      // WRITES: All writes happen after reads
+      // WRITES after reads
       if (confirmedWinner === "draw") {
         t.update(playerA_Ref, {
-          coins:        inc(playerA_Doc.data().coins, match.entryFee),
+          coins:        inc(playerA_Doc.data()?.coins ?? 0, match.entryFee),
           draws:        inc(playerA_Doc.data().draws),
           totalMatches: inc(playerA_Doc.data().totalMatches),
         });
         t.update(playerB_Ref, {
-          coins:        inc(playerB_Doc.data().coins, match.entryFee),
+          coins:        inc(playerB_Doc.data()?.coins ?? 0, match.entryFee),
           draws:        inc(playerB_Doc.data().draws),
           totalMatches: inc(playerB_Doc.data().totalMatches),
         });
@@ -605,7 +601,6 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
         }, { merge: true });
       }
 
-      // ✅ matchRef update is INSIDE the transaction now
       t.update(matchRef, {
         status:          "completed",
         confirmedWinner,
@@ -649,7 +644,6 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
     if (match.status === "completed")
       return res.status(400).json({ error: "Match already completed" });
 
-    // Write dispute log + update match atomically
     const batch = db.batch();
 
     batch.set(db.collection("disputes").doc(), {
@@ -709,6 +703,272 @@ app.get("/matches/history", verifyToken, async (req, res) => {
     res.json(history);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// REMATCH SYSTEM
+// ═══════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────
+// REMATCH REQUEST
+// Stores rematch request in match document.
+// Checks requester has enough coins.
+// ─────────────────────────────────────────
+app.post("/matches/rematch-request", verifyToken, async (req, res) => {
+  const { matchId } = req.body;
+  const uid = req.user.uid;
+
+  if (!matchId)
+    return res.status(400).json({ error: "matchId required" });
+
+  try {
+    await db.runTransaction(async (t) => {
+      const matchRef = db.collection("matches").doc(matchId);
+      const matchDoc = await t.get(matchRef);
+
+      if (!matchDoc.exists) throw new Error("Match not found");
+
+      const match = matchDoc.data();
+
+      if (match.playerA !== uid && match.playerB !== uid)
+        throw new Error("You are not in this match");
+      if (match.status !== "completed")
+        throw new Error("Match is not completed");
+      if (match.rematchRequestedBy)
+        throw new Error("Rematch already requested");
+
+      // Check requester has enough coins
+      const userRef = db.collection("users").doc(uid);
+      const userDoc = await t.get(userRef);
+      if (!userDoc.exists) throw new Error("User not found");
+      if ((userDoc.data().coins ?? 0) < match.entryFee)
+        throw new Error("Insufficient coins for rematch");
+
+      t.update(matchRef, {
+        rematchRequestedBy: uid,
+        rematchStatus:      "pending",
+        rematchRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    res.json({ message: "Rematch requested" });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// REMATCH RESPOND (accept / decline)
+// Accept: deducts coins from both players
+//         and resets match for rematch.
+// Decline: marks rematch as declined.
+// ─────────────────────────────────────────
+app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
+  const { matchId, accept } = req.body;
+  const uid = req.user.uid;
+
+  if (!matchId || accept === undefined)
+    return res.status(400).json({ error: "matchId and accept required" });
+
+  try {
+    // Decline path — simple update, no transaction needed
+    if (!accept) {
+      await db.collection("matches").doc(matchId).update({
+        rematchStatus:    "declined",
+        rematchDeclinedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      return res.json({ message: "Rematch declined" });
+    }
+
+    // Accept path — deduct coins from both, reset match
+    await db.runTransaction(async (t) => {
+      const matchRef = db.collection("matches").doc(matchId);
+      const matchDoc = await t.get(matchRef);
+
+      if (!matchDoc.exists) throw new Error("Match not found");
+
+      const match = matchDoc.data();
+
+      if (match.playerA !== uid && match.playerB !== uid)
+        throw new Error("You are not in this match");
+      if (match.rematchStatus !== "pending")
+        throw new Error("No pending rematch request");
+      if (match.rematchRequestedBy === uid)
+        throw new Error("Cannot accept your own rematch request");
+
+      const playerA_Ref = db.collection("users").doc(match.playerA);
+      const playerB_Ref = db.collection("users").doc(match.playerB);
+      const [playerA_Doc, playerB_Doc] = await Promise.all([
+        t.get(playerA_Ref),
+        t.get(playerB_Ref),
+      ]);
+
+      const coinsA = playerA_Doc.data()?.coins ?? 0;
+      const coinsB = playerB_Doc.data()?.coins ?? 0;
+
+      if (coinsA < match.entryFee)
+        throw new Error("Player A has insufficient coins");
+      if (coinsB < match.entryFee)
+        throw new Error("Player B has insufficient coins");
+
+      // Deduct entry fees from both players
+      t.update(playerA_Ref, { 
+        coins: inc(coinsA, -match.entryFee ),
+      });
+
+      t.update(playerB_Ref, {
+        coins: inc(coinsB, -match.entryFee),
+      });
+
+      // Reset match document for rematch
+      t.update(matchRef, {
+        status:             "active",
+        result:             null,
+        submittedBy:        null,
+        confirmedWinner:    null,
+        rewarded:           false,
+        rewardPaid:         0,
+        platformFee:        0,
+        confirmedAt:        null,
+        disputedAt:         null,
+        disputedBy:         null,
+        rematchStatus:      "accepted",
+        rematchStartedAt:   admin.firestore.FieldValue.serverTimestamp(),
+        // ✅ Both players sync timer from this timestamp
+        startedAt:          admin.firestore.FieldValue.serverTimestamp(),
+        matchStartedAt:     admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    res.json({ message: "Rematch accepted — match restarted" });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// AUTO RESOLVE
+// Called by Flutter when confirm timer expires.
+// Pays winner from submitted scores instead
+// of raising a dispute.
+// ─────────────────────────────────────────
+app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
+  const { matchId } = req.body;
+  const uid = req.user.uid;
+
+  if (!matchId)
+    return res.status(400).json({ error: "matchId required" });
+
+  try {
+    let confirmedWinner;
+    let payout = 0;
+    let platform = 0;
+
+    await db.runTransaction(async (t) => {
+      const matchRef = db.collection("matches").doc(matchId);
+      const matchDoc = await t.get(matchRef);
+
+      if (!matchDoc.exists) throw new Error("Match not found");
+
+      const match = matchDoc.data();
+//  Prevent double auto-resolve
+  if (match.status === "completed") {    
+    return res.json({message: "Match already resolved"});
+  }  
+
+//      if (match.playerA !== uid && match.playerB !== uid)
+//        throw new Error("You are not in this match");
+      if (match.status !== "active")
+        throw new Error("Match is not active");
+      if (!match.submittedBy)
+        throw new Error("No result submitted to resolve");
+      if (match.status === "completed") return;
+
+      // Determine winner from submitted scores
+      const scoreOf        = match.result?.scoreOf ?? {};
+      const submitter      = match.submittedBy;
+      const other          = submitter === match.playerA
+        ? match.playerB : match.playerA;
+      const submitterScore = scoreOf[submitter] ?? 0;
+      const otherScore     = scoreOf[other]     ?? 0;
+
+      if (submitterScore > otherScore)      confirmedWinner = submitter;
+      else if (otherScore > submitterScore) confirmedWinner = other;
+      else                                  confirmedWinner = "draw";
+
+      payout   = winnerPayout(match.entryFee);
+      platform = platformCut(match.entryFee);
+
+      const playerA_Ref = db.collection("users").doc(match.playerA);
+      const playerB_Ref = db.collection("users").doc(match.playerB);
+      const platformRef = db.collection("platform").doc("earnings");
+
+      // READS first
+      const [playerA_Doc, playerB_Doc, platformDoc] = await Promise.all([
+        t.get(playerA_Ref),
+        t.get(playerB_Ref),
+        t.get(platformRef),
+      ]);
+
+      if (!playerA_Doc.exists || !playerB_Doc.exists)
+        throw new Error("Player data not found");
+
+      // WRITES after reads
+      if (confirmedWinner === "draw") {
+        t.update(playerA_Ref, {
+          coins:        inc(playerA_Doc.data().coins, match.entryFee),
+          draws:        inc(playerA_Doc.data().draws),
+          totalMatches: inc(playerA_Doc.data().totalMatches),
+        });
+        t.update(playerB_Ref, {
+          coins:        inc(playerB_Doc.data().coins, match.entryFee),
+          draws:        inc(playerB_Doc.data().draws),
+          totalMatches: inc(playerB_Doc.data().totalMatches),
+        });
+      } else {
+        const loser      = confirmedWinner === match.playerA
+          ? match.playerB : match.playerA;
+        const winner_Ref = db.collection("users").doc(confirmedWinner);
+        const loser_Ref  = db.collection("users").doc(loser);
+        const winner_Doc = confirmedWinner === match.playerA
+          ? playerA_Doc : playerB_Doc;
+        const loser_Doc  = loser === match.playerA
+          ? playerA_Doc : playerB_Doc;
+
+        t.update(winner_Ref, {
+          coins:        inc(winner_Doc.data()?.coins ?? 0, payout),
+          wins:         inc(winner_Doc.data()?.wins ?? 0),
+          totalMatches: inc(winner_Doc.data()?.totalMatches ?? 0),
+        });
+        t.update(loser_Ref, {
+          losses:       inc(loser_Doc.data()?.losses ?? 0),
+          totalMatches: inc(loser_Doc.data()?.totalMatches ?? 0),
+        });
+
+        t.set(platformRef, {
+          totalCoins:  inc(
+            platformDoc.exists ? platformDoc.data().totalCoins : 0,
+            platform
+          ),
+          lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
+      t.update(matchRef, {
+        status:          "completed",
+        confirmedWinner,
+        rewarded:        true,
+        rewardPaid:      confirmedWinner === "draw" ? 0 : payout,
+        platformFee:     confirmedWinner === "draw" ? 0 : platform,
+        confirmedAt:     admin.firestore.FieldValue.serverTimestamp(),
+        autoResolved:    true,
+      });
+    });
+
+    res.json({ message: "Match auto-resolved", confirmedWinner });
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

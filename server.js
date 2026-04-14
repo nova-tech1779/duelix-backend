@@ -152,6 +152,29 @@ app.post("/update-name", verifyToken, async (req, res) => {
   }
 });
 
+app.post("/update-avatar", verifyToken, async (req, res) => {
+  const { avatar, isAsset } = req.body;
+
+  if (!avatar) {
+    return res.status(400).json({ error: "avatar required" });
+  }
+
+  try {
+    const userRef = db.collection("users").doc(req.user.uid);
+
+    await userRef.update({
+      avatar,               // e.g. "assets/avatars/avatar1.png"
+      avatarType: isAsset ? "asset" : "upload",
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    res.json({ message: "Avatar updated successfully" });
+  } catch (err) {
+    console.error("Avatar update error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ═══════════════════════════════════════════════════════════════
 // COINS (standalone utility endpoints)
 // ═══════════════════════════════════════════════════════════════

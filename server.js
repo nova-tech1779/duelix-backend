@@ -813,10 +813,10 @@ res.status(400).json({ error: err.message });
 app.post("/matches/rematch-request", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 const uid = req.user.uid;
-});
 
-if (!matchId)
+if (!matchId) {   
 return res.status(400).json({ error: "matchId required" });
+}
 
 try {
 await db.runTransaction(async (t) => {
@@ -840,20 +840,25 @@ if (!userDoc.exists) throw new Error("User not found");
 if ((userDoc.data().coins ?? 0) < match.entryFee)
   throw new Error("Insufficient coins for rematch");
 
+const admin = require("firebase-admin");
+
 t.update(userRef, {
-  coins: inc(userDoc.data().coins, -match.entryFee)
+  coins: admin.firestore.FieldValue.increment(-match.entryFee)
 });
+
 t.update(matchRef, {
 rematchRequestedBy: uid,
-rematchStatus:      "pending",
+rematchStatus: "pending",
 rematchRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
 });
 });
+
 res.json({ message: "Rematch requested" });
 
 } catch (err) {
 res.status(400).json({ error: err.message });
 }
+});
 // ─────────────────────────────────────────
 // REMATCH RESPOND (accept / decline)
 // Accept: deducts coins from both players,

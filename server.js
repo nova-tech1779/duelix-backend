@@ -293,7 +293,7 @@ res.status(500).json({ error: err.message });
 }
 });
 
-//app.post("/add-coins", verifyToken, async (req, res) => {
+app.post("/add-coins", verifyToken, async (req, res) => {
 const { amount } = req.body;
 if (!amount || amount <= 0)
 return res.status(400).json({ error: "Valid amount required" });
@@ -309,7 +309,7 @@ res.json({ message: "Coins added" });
 } catch (err) {
 res.status(500).json({ error: err.message });
 }
-//});
+});
 
 app.post("/reset-account", verifyToken, async (req, res) => {
 const { coins } = req.body;

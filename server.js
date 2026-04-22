@@ -448,11 +448,14 @@ await db.runTransaction(async (t) => {
   // Both writes happen atomically — if match creation fails, no deduction
   t.update(userRef, { coins: coins - entryFee });
 
+  //Force uppercase before saving
+  const normalizedGame = game?.toUpperCase();
+
   t.set(matchRef, {
     id:                 matchId,
     playerA:            uid,
     playerB:            null,
-    game,
+    game:               normalizedGame,
     entryFee,           // always a positive integer — validated above
     status:             "waiting",
     result:             null,

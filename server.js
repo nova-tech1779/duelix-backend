@@ -23,16 +23,13 @@ allowedHeaders: ["Content-Type", "Authorization"],
 app.use(express.json());
 
 // ─────────────────────────────────────────
-// CACHE CONTROL MIDDLEWARE
-// ✅ FIX 5: Prevents any proxy, CDN, or HTTP client from caching
-//    responses. Every request to this backend gets fresh data
-//    from Firestore. Applied globally to all routes.
+// CACHE CONTROL — applied globally
 // ─────────────────────────────────────────
 app.use((_req, res, next) => {
 res.set({
-"Cache-Control": "no-store, no-cache, must-revalidate, proxy-revalidate",
-"Pragma":        "no-cache",
-"Expires":       "0",
+"Cache-Control":     "no-store, no-cache, must-revalidate, proxy-revalidate",
+"Pragma":            "no-cache",
+"Expires":           "0",
 "Surrogate-Control": "no-store",
 });
 next();
@@ -42,49 +39,29 @@ next();
 // HELPERS
 // ─────────────────────────────────────────
 
-/** Safe integer increment — never NaN */
 const inc = (current, by = 1) => (Number(current) || 0) + by;
 
-/** 90/10 split */
 const winnerPayout = (entryFee) => Math.floor(entryFee * 2 * 0.9);
 const platformCut  = (entryFee) => Math.floor(entryFee * 2 * 0.1);
 
-/**
+function validateEntryFee(entryFee) {
+if (typeof entryFee !== "number" || !Number.isInteger(entryFee) || entryFee <= 0) {
+throw new Error("entryFee must be a positive integer");
+}
+}
 
-- ✅ FIX 3: Validates entryFee is a positive integer.
-- Floats like 49.9 would cause coin arithmetic inconsistency.
-  */
-  function validateEntryFee(entryFee) {
-  if (typeof entryFee !== "number" || !Number.isInteger(entryFee) || entryFee <= 0) {
-  throw new Error("entryFee must be a positive integer");
-  }
-  }
+function hasSubmittedResult(match) {
+return match.submittedBy != null;
+}
 
-/**
-
-- ✅ FIX 2 & 4: Checks whether a result has been submitted.
-- Uses nullish check (null OR undefined) so missing fields
-- don’t accidentally allow a second submission.
-  */
-  function hasSubmittedResult(match) {
-  return match.submittedBy != null; // covers both null and undefined
-  }
-
-/**
-
-- Core reward distribution — shared by confirm-result and auto-resolve.
-- All reads happen before any writes (Firestore transaction requirement).
-- ✅ FIX 7: Clears rematch fields on completion so ticker/rematch UI resets.
-  */
-  async function distributeReward(t, match, matchRef, confirmedWinner) {
-  const payout   = winnerPayout(match.entryFee);
-  const platform = platformCut(match.entryFee);
+async function distributeReward(t, match, matchRef, confirmedWinner) {
+const payout   = winnerPayout(match.entryFee);
+const platform = platformCut(match.entryFee);
 
 const playerA_Ref = db.collection("users").doc(match.playerA);
 const playerB_Ref = db.collection("users").doc(match.playerB);
 const platformRef = db.collection("platform").doc("earnings");
 
-// All reads first
 const playerA_Doc = await t.get(playerA_Ref);
 const playerB_Doc = await t.get(playerB_Ref);
 const platformDoc = await t.get(platformRef);
@@ -127,7 +104,6 @@ t.set(platformRef, {
 
 }
 
-// Mark match completed and clear rematch fields for next round
 t.update(matchRef, {
 status:             "completed",
 confirmedWinner,
@@ -146,7 +122,7 @@ return { payout, platform, confirmedWinner };
 // ─────────────────────────────────────────
 // HEALTH
 // ─────────────────────────────────────────
-app.get("/", (_req, res) => res.send("Duelix backend is live 🚀"));
+app.get("/",       (_req, res) => res.send("Duelix backend is live 🚀"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ═══════════════════════════════════════════════════════════════
@@ -164,11 +140,10 @@ const userDoc = await userRef.get();
 if (userDoc.exists)
 return res.status(400).json({ error: "User already exists" });
 
-// ⚠️ TODO: hash password before storing (bcrypt recommended)
 await userRef.set({
   uid:          phone,
   phone,
-  password,                         // plain-text — hash in production
+  password,
   displayName:  displayName || "Player",
   coins:        100,
   wins:         0,
@@ -198,7 +173,6 @@ if (!userDoc.exists)
 return res.status(404).json({ error: "User not found" });
 
 const user = userDoc.data();
-// ⚠️ TODO: compare hashed password (bcrypt.compare)
 if (user.password !== password)
   return res.status(401).json({ error: "Wrong password" });
 
@@ -210,7 +184,6 @@ res.status(500).json({ error: err.message });
 }
 });
 
-// ⚠️ No auth — add verifyToken + ownership check before production
 app.post("/reset-password-direct", async (req, res) => {
 const { phone, newPassword } = req.body;
 try {
@@ -329,9 +302,6 @@ res.status(500).json({ error: err.message });
 
 // ═══════════════════════════════════════════════════════════════
 // DAILY REWARD
-// Streak-based coin reward — matches frontend reward table:
-//   Day 1–2 → 5 coins | Day 3–4 → 6 coins | Day 5 → 7 coins
-//   Day 6   → 8 coins | Day 7   → 20 coins (then resets)
 // ═══════════════════════════════════════════════════════════════
 
 function getStreakReward(streak) {
@@ -340,7 +310,7 @@ if (day <= 2) return 5;
 if (day <= 4) return 6;
 if (day === 5) return 7;
 if (day === 6) return 8;
-return 20; // day 7
+return 20;
 }
 
 app.post("/claim-daily-reward", verifyToken, async (req, res) => {
@@ -402,22 +372,8 @@ res.status(400).json({ error: err.message });
 
 // ═══════════════════════════════════════════════════════════════
 // MATCH SYSTEM
-// Flow:
-//   1. Create match   → creator’s coins deducted atomically
-//   2. Join match     → joiner’s coins deducted atomically, match → active
-//   3. Submit result  → one player submits scores
-//   4. Confirm result → other player confirms → reward paid
-//      OR dispute     → match flagged for review
-//      OR auto-resolve → confirm timer (3 min) expired with submission
-//      OR auto-cancel  → match timer (20 min) expired with NO submission
 // ═══════════════════════════════════════════════════════════════
 
-// ─────────────────────────────────────────
-// CREATE MATCH
-// ✅ FIX 1 & 3: Fully atomic — coin deduction and match document
-//    creation happen in the same transaction. If either fails,
-//    both are rolled back. No partial state possible.
-// ─────────────────────────────────────────
 app.post("/matches/create", verifyToken, async (req, res) => {
 const { game, entryFee } = req.body;
 const uid = req.user.uid;
@@ -425,7 +381,6 @@ const uid = req.user.uid;
 if (!game)
 return res.status(400).json({ error: "game is required" });
 
-// ✅ FIX 3: Validate entryFee is a positive integer before any DB work
 try { validateEntryFee(entryFee); }
 catch (err) { return res.status(400).json({ error: err.message }); }
 
@@ -440,15 +395,11 @@ await db.runTransaction(async (t) => {
   const coins = userDoc.data().coins ?? 0;
   if (coins < entryFee) throw new Error("Insufficient coins");
 
-  // ✅ FIX 3: Create matchRef first so matchId is set before any writes.
-  //    Firestore doc() generates the ID client-side — no async needed.
   const matchRef = db.collection("matches").doc();
   matchId = matchRef.id;
 
-  // Both writes happen atomically — if match creation fails, no deduction
   t.update(userRef, { coins: coins - entryFee });
 
-  //Force uppercase before saving
   const normalizedGame = game?.toUpperCase();
 
   t.set(matchRef, {
@@ -456,7 +407,7 @@ await db.runTransaction(async (t) => {
     playerA:            uid,
     playerB:            null,
     game:               normalizedGame,
-    entryFee,           // always a positive integer — validated above
+    entryFee,
     status:             "waiting",
     result:             null,
     submittedBy:        null,
@@ -475,13 +426,11 @@ await db.runTransaction(async (t) => {
   });
 });
 
-// ✅ FIX 1: Return full match data so Flutter can immediately
-//    display the match in "My Matches" without a second fetch.
 res.status(201).json({
   matchId,
-  status:   "waiting",
-  playerA:  uid,
-  playerB:  null,
+  status:  "waiting",
+  playerA: uid,
+  playerB: null,
   game,
   entryFee,
 });
@@ -491,52 +440,28 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// GET MATCHES
-// ✅ FIX 1 & 4 & 5: Returns all waiting and active matches in a
-//    single response. Cache-Control headers (applied globally above)
-//    ensure every call fetches fresh data from Firestore.
-//    Filters out matches missing required fields to prevent
-//    UI inconsistency from partially-written documents.
-// ─────────────────────────────────────────
+// NOTE: GET /matches is kept for any internal tooling or admin use,
+// but HomeScreen no longer calls it — it reads Firestore directly.
 app.get("/matches", verifyToken, async (req, res) => {
 try {
 const [waitingSnap, activeSnap] = await Promise.all([
-db.collection("matches")
-.where("status", "==", "waiting")
-.orderBy("createdAt", "desc")   // newest first — consistent ordering
-.get(),
-db.collection("matches")
-.where("status", "==", "active")
-.orderBy("startedAt", "desc")
-.get(),
+db.collection("matches").where("status", "==", "waiting").orderBy("createdAt", "desc").get(),
+db.collection("matches").where("status", "==", "active").orderBy("startedAt", "desc").get(),
 ]);
 
 const matches = [
   ...waitingSnap.docs.map(d => d.data()),
   ...activeSnap.docs.map(d => d.data()),
-].filter(m =>
-  // ✅ FIX 4: Drop incomplete documents — a match without an id,
-  //    playerA, or game is a partial write that shouldn't be shown.
-  m.id && m.playerA && m.game
-);
+].filter(m => m.id && m.playerA && m.game);
 
 res.json(matches);
 
 } catch (err) {
-// ✅ FIX 8: Structured error — never a silent 200 with empty body
 console.error("GET /matches error:", err);
 res.status(500).json({ error: "Failed to load matches. Please try again." });
 }
 });
 
-// ─────────────────────────────────────────
-// JOIN MATCH
-// ✅ FIX 2: Assigns playerB and sets status → "active" atomically
-//    with coin deduction. Both operations are in one transaction
-//    so the match is never in an inconsistent "active" state with
-//    no opponent, or an "opponent assigned" state with no coin deduction.
-// ─────────────────────────────────────────
 app.post("/matches/join", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 const uid = req.user.uid;
@@ -561,7 +486,6 @@ await db.runTransaction(async (t) => {
   const match = matchDoc.data();
   const coins = userDoc.data().coins ?? 0;
 
-  // ✅ FIX 2: All guards before any writes
   if (match.status !== "waiting")  throw new Error("Match no longer available");
   if (match.playerA === uid)       throw new Error("Cannot join your own match");
   if (match.playerB != null)       throw new Error("Match already has an opponent");
@@ -569,17 +493,14 @@ await db.runTransaction(async (t) => {
 
   const now = admin.firestore.FieldValue.serverTimestamp();
 
-  // Atomic: deduct coins + assign playerB + activate match
   t.update(userRef, { coins: coins - match.entryFee });
   t.update(matchRef, {
     playerB:        uid,
-    status:         "active",      // ✅ FIX 2: Goes active immediately
+    status:         "active",
     startedAt:      now,
     matchStartedAt: now,
   });
 
-  // Capture for response — serverTimestamp not readable until after commit,
-  // so we approximate with current time for the immediate response
   joinedMatch = {
     matchId:  match.id,
     playerA:  match.playerA,
@@ -590,8 +511,6 @@ await db.runTransaction(async (t) => {
   };
 });
 
-// ✅ FIX 1: Return match data so Flutter knows the full match state
-//    immediately without a second API call
 res.json({ message: "Joined match successfully", match: joinedMatch });
 
 } catch (err) {
@@ -599,11 +518,6 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// CANCEL MATCH (waiting state only)
-// Creator cancels before anyone joins.
-// For active match timer expiry with no submission, use /matches/auto-cancel.
-// ─────────────────────────────────────────
 app.post("/matches/cancel", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 const uid = req.user.uid;
@@ -631,7 +545,6 @@ const matchDoc = await t.get(matchRef);
   const userDoc = await t.get(userRef);
   if (!userDoc.exists) throw new Error("User not found");
 
-  // Refund creator atomically
   t.update(userRef, { coins: inc(userDoc.data().coins, match.entryFee) });
   t.update(matchRef, {
     status:      "cancelled",
@@ -646,12 +559,6 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// SUBMIT RESULT
-// ✅ FIX 2: Uses hasSubmittedResult() which correctly handles
-//    both null and undefined submittedBy field values.
-//    Result is immediately available for the opponent to confirm.
-// ─────────────────────────────────────────
 app.post("/matches/submit-result", verifyToken, async (req, res) => {
 const { matchId, myScore, opponentScore } = req.body;
 const uid = req.user.uid;
@@ -675,12 +582,9 @@ const matchDoc = await t.get(matchRef);
     throw new Error("You are not in this match");
   if (match.status !== "active")
     throw new Error("Match is not active");
-
-  // ✅ FIX 2: hasSubmittedResult covers null AND undefined
   if (hasSubmittedResult(match))
     throw new Error("Result already submitted — waiting for opponent to confirm");
 
-  // Build scoreOf so confirm-result can read both players' scores
   const opponentUid = uid === match.playerA ? match.playerB : match.playerA;
 
   t.update(matchRef, {
@@ -688,7 +592,7 @@ const matchDoc = await t.get(matchRef);
       myScore,
       opponentScore,
       scoreOf: {
-        [uid]:        myScore,
+        [uid]:         myScore,
         [opponentUid]: opponentScore,
       },
     },
@@ -704,10 +608,6 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// CONFIRM RESULT
-// Called by the player who did NOT submit.
-// ─────────────────────────────────────────
 app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 const uid = req.user.uid;
@@ -758,9 +658,6 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// DISPUTE
-// ─────────────────────────────────────────
 app.post("/matches/dispute", verifyToken, async (req, res) => {
 const { matchId, reason } = req.body;
 const uid = req.user.uid;
@@ -783,7 +680,6 @@ if (match.status === "completed")
   return res.status(400).json({ error: "Match already completed" });
 
 const batch = db.batch();
-
 batch.set(db.collection("disputes").doc(), {
   matchId,
   reportedBy: uid,
@@ -791,13 +687,11 @@ batch.set(db.collection("disputes").doc(), {
   matchData:  match,
   createdAt:  admin.firestore.FieldValue.serverTimestamp(),
 });
-
 batch.update(matchRef, {
   status:     "disputed",
   disputedAt: admin.firestore.FieldValue.serverTimestamp(),
   disputedBy: uid,
 });
-
 await batch.commit();
 
 res.json({ message: "Dispute submitted — under review" });
@@ -807,9 +701,6 @@ res.status(500).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// MATCH HISTORY
-// ─────────────────────────────────────────
 app.get("/matches/history", verifyToken, async (req, res) => {
 const uid = req.user.uid;
 
@@ -846,25 +737,9 @@ res.status(500).json({ error: err.message });
 });
 
 // ═══════════════════════════════════════════════════════════════
-// TIMER EXPIRY LOGIC
-//
-// Flutter checks submittedBy when the 20-minute match timer hits zero:
-//
-//   submittedBy !== null  →  POST /matches/auto-resolve
-//     A result exists. Pay winner from submitted scores.
-//     (also called when the 3-minute confirm timer expires)
-//
-//   submittedBy === null  →  POST /matches/auto-cancel
-//     No result submitted. Refund both players in full.
-//
-// Both endpoints are fully idempotent — safe to call more than once.
-// ✅ FIX 7: No ticker-related Firestore listeners. These endpoints
-//    are only triggered by Flutter timers, not scheduled jobs.
+// TIMER EXPIRY
 // ═══════════════════════════════════════════════════════════════
 
-// ─────────────────────────────────────────
-// AUTO RESOLVE
-// ─────────────────────────────────────────
 app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 
@@ -882,7 +757,6 @@ await db.runTransaction(async (t) => {
 
   const match = matchDoc.data();
 
-  // Idempotency guard — read state BEFORE writing anything
   if (match.status === "completed" || match.rewarded === true || match.autoResolved === true) {
     result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true };
     return;
@@ -926,11 +800,6 @@ res.status(400).json({ error: err.message });
 }
 });
 
-// ─────────────────────────────────────────
-// AUTO CANCEL
-// Called when the 20-minute match timer expires AND submittedBy === null.
-// Refunds both players’ entry fees in full. Fully idempotent.
-// ─────────────────────────────────────────
 app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
 const { matchId } = req.body;
 
@@ -1121,26 +990,20 @@ res.status(400).json({ error: err.message });
 // ─────────────────────────────────────────
 app.get("/leaderboard", verifyToken, async (req, res) => {
 try {
-const snap = await db.collection("users")
-.orderBy("wins", "desc")
-.limit(20)
-.get();
-
+const snap = await db.collection("users").orderBy("wins", "desc").limit(20).get();
 const leaderboard = snap.docs.map((doc, i) => {
-  const d = doc.data();
-  return {
-    rank:         i + 1,
-    uid:          d.uid,
-    displayName:  d.displayName ?? "Player",
-    wins:         d.wins ?? 0,
-    losses:       d.losses ?? 0,
-    totalMatches: d.totalMatches ?? 0,
-    avatar:       d.avatar ?? null,
-  };
+const d = doc.data();
+return {
+rank:         i + 1,
+uid:          d.uid,
+displayName:  d.displayName ?? "Player",
+wins:         d.wins ?? 0,
+losses:       d.losses ?? 0,
+totalMatches: d.totalMatches ?? 0,
+avatar:       d.avatar ?? null,
+};
 });
-
 res.json(leaderboard);
-
 } catch (err) {
 res.status(500).json({ error: err.message });
 }
@@ -1157,7 +1020,8 @@ const snap = await db.collection("users")
 .limit(1)
 .get();
 
-res.json({ available: snap.empty });a
+// ✅ FIX: removed stray 'a' that caused syntax error + server crash
+res.json({ available: snap.empty });
 
 } catch (err) {
 res.status(500).json({ error: err.message });

@@ -15,11 +15,26 @@ const verifyToken   = require("./middleware/verifyToken");
 
 const app = express();
 
+const allowedOrigins = [
+  "https://duelix-app.web.app",
+  "http://localhost:3000",
+  "http://localhost:5173",
+];
+
 app.use(cors({
-origin: true,
-methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-allowedHeaders: ["Content-Type", "Authorization"],
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("CORS blocked"));
+    }
+  },
+
+  credentials: true,
+  allowedHeaders: "*",
 }));
+
+app.options("*", cors());
 app.use(express.json());
 
 // ─────────────────────────────────────────

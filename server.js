@@ -617,6 +617,172 @@ res.status(400).json({ error: err.message });
 }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// QUICK MATCH — Atomic find-or-create
+//
+// This is the server-controlled matchmaking endpoint. It runs
+// entirely inside a Firestore transaction so two players can never
+// grab the same waiting match at the same time.
+//
+// Flow:
+//   1. Query for a waiting quick match with matching game + entryFee
+//      where isPrivate == false and playerB == null.
+//   2. If found → join it atomically (set playerB, status=active).
+//   3. If not found → create a new waiting quick match.
+//
+// Required Firestore composite index:
+//   Collection: matches
+//   status      ASC
+//   game        ASC
+//   entryFee    ASC
+//   isPrivate   ASC
+//   playerB     ASC  (optional — server filters in-memory as fallback)
+// ═══════════════════════════════════════════════════════════════
+app.post("/matches/quick-match", verifyToken, async (req, res) => {
+const { game, entryFee } = req.body;
+const uid = req.user.uid;
+
+if (!game)
+return res.status(400).json({ error: "game is required" });
+
+try { validateEntryFee(entryFee); }
+catch (err) { return res.status(400).json({ error: err.message }); }
+
+// game must always be stored in uppercase for consistent comparison
+const gameUpper = game.toUpperCase();
+
+try {
+let matchId   = null;
+let didCreate = false;
+
+// ── Step 1: Look for an existing waiting quick match ──────────
+// We query by status + game + entryFee + isPrivate.
+// playerB filter is applied in-memory as a safety net because
+// Firestore inequality filters on multiple fields require an index
+// and null comparisons are not reliable across SDK versions.
+const candidateSnap = await db
+  .collection("matches")
+  .where("status",    "==", "waiting")
+  .where("game",      "==", gameUpper)
+  .where("entryFee",  "==", entryFee)
+  .where("isPrivate", "==", false)
+  .orderBy("createdAt", "asc") // oldest first → fairest queue
+  .limit(10)                   // fetch a small batch to filter in-memory
+  .get();
+
+// Filter in-memory: exclude own matches and full matches
+const candidates = candidateSnap.docs.filter((doc) => {
+  const d = doc.data();
+  return d.playerA !== uid && d.playerB === null;
+});
+
+console.log(
+  `[quick-match] uid=${uid} game=${gameUpper} fee=${entryFee} ` +
+  `candidates=${candidates.length}`
+);
+
+if (candidates.length > 0) {
+  // ── Step 2: JOIN an existing match inside a transaction ─────
+  const targetDoc = candidates[0];
+  matchId = targetDoc.id;
+
+  await db.runTransaction(async (t) => {
+    const matchRef = db.collection("matches").doc(matchId);
+    const userRef  = db.collection("users").doc(uid);
+
+    const [matchDoc, userDoc] = await Promise.all([
+      t.get(matchRef),
+      t.get(userRef),
+    ]);
+
+    if (!matchDoc.exists) throw new Error("Match no longer exists");
+    if (!userDoc.exists)  throw new Error("User not found");
+
+    const match = matchDoc.data();
+    const coins = userDoc.data().coins ?? 0;
+
+    // Re-validate inside transaction (prevents race condition)
+    if (match.status    !== "waiting") throw new Error("Match no longer available");
+    if (match.playerA   === uid)       throw new Error("Cannot join your own match");
+    if (match.playerB   != null)       throw new Error("Match already taken — try again");
+    if (match.isPrivate === true)      throw new Error("Cannot join a private match");
+    if (coins < match.entryFee)        throw new Error("Insufficient coins");
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    t.update(userRef, { coins: coins - match.entryFee });
+    t.update(matchRef, {
+      playerB:        uid,
+      players:        admin.firestore.FieldValue.arrayUnion(uid),
+      status:         "active",
+      startedAt:      now,
+      matchStartedAt: now,
+    });
+  });
+
+  console.log(`[quick-match] JOINED existing match ${matchId} uid=${uid}`);
+
+} else {
+  // ── Step 3: CREATE a new waiting quick match ─────────────────
+  didCreate = true;
+
+  await db.runTransaction(async (t) => {
+    const userRef  = db.collection("users").doc(uid);
+    const matchRef = db.collection("matches").doc();
+    matchId = matchRef.id;
+
+    const userDoc = await t.get(userRef);
+    if (!userDoc.exists) throw new Error("User not found");
+
+    const coins = userDoc.data().coins ?? 0;
+    if (coins < entryFee) throw new Error("Insufficient coins");
+
+    t.update(userRef, { coins: coins - entryFee });
+
+    t.set(matchRef, {
+      id:                 matchId,
+      playerA:            uid,
+      playerB:            null,
+      players:            [uid],
+      game:               gameUpper,
+      entryFee,
+      status:             "waiting",
+      matchType:          "quick",
+      isPrivate:          false,
+      result:             null,
+      submittedBy:        null,
+      submittedAt:        null,
+      confirmedWinner:    null,
+      rewarded:           false,
+      createdAt:          admin.firestore.FieldValue.serverTimestamp(),
+      startedAt:          null,
+      matchStartedAt:     null,
+      rematchRequestedBy: null,
+      rematchStatus:      null,
+      rematchRequestedAt: null,
+      autoResolved:       false,
+      autoCancelled:      false,
+      cancelReason:       null,
+    });
+  });
+
+  console.log(`[quick-match] CREATED new match ${matchId} uid=${uid}`);
+}
+
+res.status(didCreate ? 201 : 200).json({
+  matchId,
+  action:       didCreate ? "created" : "joined",
+  status:       didCreate ? "waiting" : "active",
+  winnerReward: winnerReward(entryFee),
+  loserReward:  loserReward(entryFee),
+});
+
+} catch (err) {
+console.error(`[quick-match] ERROR uid=${uid}:`, err.message);
+res.status(400).json({ error: err.message });
+}
+});
+
 app.post("/matches/submit-result", verifyToken, async (req, res) => {
 const { matchId, myScore, opponentScore } = req.body;
 const uid = req.user.uid;

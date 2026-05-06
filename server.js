@@ -55,6 +55,33 @@ app.use((_req, res, next) => {
 const inc = (current, by = 1) => (Number(current) || 0) + by;
 
 // ─────────────────────────────────────────
+// REFERRAL CODE GENERATOR
+// Format: DUEL-XXXX  (uppercase alphanumeric, collision-resistant)
+// ─────────────────────────────────────────
+function generateReferralCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I to avoid confusion
+  let code = "DUEL-";
+  for (let i = 0; i < 6; i++) {
+    code += chars[Math.floor(Math.random() * chars.length)];
+  }
+  return code;
+}
+
+async function uniqueReferralCode() {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const code = generateReferralCode();
+    const snap = await db
+      .collection("users")
+      .where("referralCode", "==", code)
+      .limit(1)
+      .get();
+    if (snap.empty) return code;
+  }
+  // Fallback with timestamp suffix — virtually impossible to collide
+  return `DUEL-${Date.now().toString(36).toUpperCase().slice(-6)}`;
+}
+
+// ─────────────────────────────────────────
 // REWARD DISTRIBUTION — 80 / 10 / 10
 // ─────────────────────────────────────────
 const pool         = (entryFee) => entryFee * 2;
@@ -162,84 +189,64 @@ app.get("/",       (_req, res) => res.send("Duelix backend is live 🚀"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ═══════════════════════════════════════════════════════════════
-// AUTH
-//
-// All authentication is now handled by Firebase on the client side:
-//   • Google Sign-In   (all platforms)
-//   • Email Magic Link (passwordless, all platforms)
-//
-// The backend NEVER issues custom tokens or stores passwords.
-// Every protected endpoint validates the Firebase ID token via
-// the verifyToken middleware (admin.auth().verifyIdToken).
-//
-// The three legacy password endpoints (/register, /login,
-// /reset-password-direct) have been removed.
-//
-// Auth-related endpoints kept:
-//   POST /users/create-profile  — idempotent first-time profile creation
-//   GET  /user-exists/:uid      — public existence check (UX hint only)
+// AUTH — Firebase Google + Magic Link (client-side)
 // ═══════════════════════════════════════════════════════════════
 
 // ─────────────────────────────────────────
 // CREATE USER PROFILE — protected, idempotent
-//
-// Called by Flutter AuthService.createUserProfile() after the user
-// signs in (Google or Magic Link) and the onboarding form is submitted.
-//
-// Uses the verified Firebase uid as the Firestore document ID.
-// Safe to call multiple times — only writes if the doc is missing.
+// Generates a unique referral code on first creation.
 // ─────────────────────────────────────────
 app.post("/users/create-profile", verifyToken, async (req, res) => {
-  const uid = req.user.uid; // always from the verified Firebase ID token
+  const uid = req.user.uid;
   const { displayName, phone, email } = req.body;
 
   if (!displayName || !phone) {
-    return res
-      .status(400)
-      .json({ error: "displayName and phone are required" });
+    return res.status(400).json({ error: "displayName and phone are required" });
   }
 
-  // Validate E.164 phone format
   if (!/^\+\d{7,15}$/.test(phone)) {
     return res.status(400).json({
       error: "phone must be in E.164 format (e.g. +233244123456)",
     });
   }
 
-  // Validate display name
   const name = displayName.trim();
   if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) {
     return res.status(400).json({
-      error: "displayName: 3–20 chars, letters/numbers/underscores/spaces only",
+      error: "displayName: 3–20 chars, letters/numbers/underscores/dots only",
     });
   }
 
   try {
-    const userRef = db.collection("users").doc(uid);
+    const userRef      = db.collection("users").doc(uid);
+    const referralCode = await uniqueReferralCode();
 
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
+      if (snap.exists) return; // idempotent
 
-      // Idempotent — never overwrite an existing profile
-      if (snap.exists) return;
-
-      // Duplicate phone guard — one Firestore doc per phone number
+      // Duplicate phone guard
       const phoneSnap = await db
         .collection("users")
         .where("phone", "==", phone)
         .limit(1)
         .get();
+      if (!phoneSnap.empty) throw new Error("PHONE_TAKEN");
 
-      if (!phoneSnap.empty) {
-        throw new Error("PHONE_TAKEN");
-      }
+      // Duplicate username guard
+      const nameSnap = await db
+        .collection("users")
+        .where("displayName", "==", name)
+        .limit(1)
+        .get();
+      if (!nameSnap.empty) throw new Error("USERNAME_TAKEN");
 
       t.set(userRef, {
         uid,
-        displayName: name,
+        displayName:  name,
         phone,
         email:        email ?? "",
-        coins:        20,   // welcome bonus
+        coins:        20,              // base sign-up bonus
         wins:         0,
         losses:       0,
         draws:        0,
@@ -247,16 +254,20 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         loginStreak:  0,
         lastLogin:    null,
         avatar:       "assets/avatars/avatar1.png",
+        referralCode,                  // DUEL-XXXXXX
+        referredBy:   null,
+        referralCount: 0,
         createdAt:    admin.firestore.FieldValue.serverTimestamp(),
       });
     });
 
-    res.status(201).json({ message: "Profile created", uid });
+    res.status(201).json({ message: "Profile created", uid, referralCode });
   } catch (err) {
     if (err.message === "PHONE_TAKEN") {
-      return res.status(409).json({
-        error: "A profile with that phone number already exists",
-      });
+      return res.status(409).json({ error: "That phone number is already registered" });
+    }
+    if (err.message === "USERNAME_TAKEN") {
+      return res.status(409).json({ error: "That username is already taken" });
     }
     console.error("[create-profile]", err.message);
     res.status(500).json({ error: err.message });
@@ -264,16 +275,110 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// USER EXISTS CHECK — public (no token)
-//
-// Used by the Flutter auth gate to confirm a Firestore profile
-// exists after sign-in. Never used as a security gate.
+// USER EXISTS CHECK — public
 // ─────────────────────────────────────────
 app.get("/user-exists/:uid", async (req, res) => {
   try {
     const doc = await db.collection("users").doc(req.params.uid).get();
     res.json({ exists: doc.exists });
   } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// REFERRAL SYSTEM
+// ═══════════════════════════════════════════════════════════════
+
+// POST /apply-referral
+// Body: { referralCode: string }
+// Auth: Bearer token (currentUid from token)
+//
+// Rewards:
+//   New user  → +10 coins  (on top of the 20 sign-up bonus = 30 total)
+//   Referrer  → +15 coins
+//
+// Rules:
+//   • Code must exist
+//   • Cannot self-refer
+//   • Can only apply once (referredBy must be null)
+// ─────────────────────────────────────────
+app.post("/apply-referral", verifyToken, async (req, res) => {
+  const currentUid = req.user.uid;
+  const { referralCode } = req.body;
+
+  if (!referralCode || typeof referralCode !== "string") {
+    return res.status(400).json({ error: "referralCode is required" });
+  }
+
+  const code = referralCode.trim().toUpperCase();
+
+  try {
+    // Find referrer by code
+    const codeSnap = await db
+      .collection("users")
+      .where("referralCode", "==", code)
+      .limit(1)
+      .get();
+
+    if (codeSnap.empty) {
+      return res.status(404).json({ error: "Referral code not found" });
+    }
+
+    const referrerDoc = codeSnap.docs[0];
+    const referrerUid = referrerDoc.id;
+
+    // Self-referral guard
+    if (referrerUid === currentUid) {
+      return res.status(400).json({ error: "You cannot use your own referral code" });
+    }
+
+    let bonusCoins = 0;
+
+    await db.runTransaction(async (t) => {
+      const currentRef  = db.collection("users").doc(currentUid);
+      const referrerRef = db.collection("users").doc(referrerUid);
+
+      const [currentDoc, referrerDocT] = await Promise.all([
+        t.get(currentRef),
+        t.get(referrerRef),
+      ]);
+
+      if (!currentDoc.exists)  throw new Error("Your account was not found");
+      if (!referrerDocT.exists) throw new Error("Referrer account not found");
+
+      const currentData  = currentDoc.data();
+      const referrerData = referrerDocT.data();
+
+      // Already used a referral code
+      if (currentData.referredBy) {
+        throw new Error("ALREADY_REFERRED");
+      }
+
+      bonusCoins = 10; // referral bonus for new user
+
+      // Credit new user
+      t.update(currentRef, {
+        coins:      inc(currentData.coins, bonusCoins),
+        referredBy: referrerUid,
+      });
+
+      // Credit referrer
+      t.update(referrerRef, {
+        coins:         inc(referrerData.coins, 15),
+        referralCount: inc(referrerData.referralCount ?? 0),
+      });
+    });
+
+    res.json({
+      message:    "Referral applied successfully",
+      bonusCoins,
+    });
+  } catch (err) {
+    if (err.message === "ALREADY_REFERRED") {
+      return res.status(409).json({ error: "You have already used a referral code" });
+    }
+    console.error("[apply-referral]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -292,25 +397,35 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
   }
 });
 
+// ─────────────────────────────────────────
+// UPDATE DISPLAY NAME — with uniqueness check
+// ─────────────────────────────────────────
 app.post("/update-name", verifyToken, async (req, res) => {
   const { displayName } = req.body;
   if (!displayName)
     return res.status(400).json({ error: "displayName required" });
 
   const name = displayName.trim();
-  if (
-    name.length < 3 ||
-    name.length > 20 ||
-    !/^[a-zA-Z0-9_ ]+$/.test(name)
-  ) {
+  if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) {
     return res.status(400).json({
-      error: "displayName: 3–20 chars, letters/numbers/underscores/spaces only",
+      error: "displayName: 3–20 chars, letters/numbers/underscores/dots only",
     });
   }
 
   try {
+    // Check uniqueness (exclude own doc)
+    const snap = await db
+      .collection("users")
+      .where("displayName", "==", name)
+      .limit(1)
+      .get();
+
+    if (!snap.empty && snap.docs[0].id !== req.user.uid) {
+      return res.status(409).json({ error: "That username is already taken" });
+    }
+
     await db.collection("users").doc(req.user.uid).update({ displayName: name });
-    res.json({ message: "Name updated" });
+    res.json({ message: "Username updated" });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -345,7 +460,10 @@ app.get("/check-username/:username", verifyToken, async (req, res) => {
       .where("displayName", "==", username)
       .limit(1)
       .get();
-    res.json({ available: snap.empty });
+    // Available if empty OR the only match is the requesting user themselves
+    const available =
+      snap.empty || snap.docs[0].id === req.user.uid;
+    res.json({ available });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -655,7 +773,7 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
-// QUICK MATCH — Atomic server-side find-or-create
+// QUICK MATCH
 // ═══════════════════════════════════════════════════════════════
 app.post("/matches/quick-match", verifyToken, async (req, res) => {
   const { game, entryFee } = req.body;
@@ -687,10 +805,7 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
       return d.playerA !== uid && d.playerB === null;
     });
 
-    console.log(
-      `[quick-match] uid=${uid} game=${gameUpper} fee=${entryFee} ` +
-      `candidates=${candidates.length}`
-    );
+    console.log(`[quick-match] uid=${uid} game=${gameUpper} fee=${entryFee} candidates=${candidates.length}`);
 
     if (candidates.length > 0) {
       matchId = candidates[0].id;
@@ -698,10 +813,7 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
       await db.runTransaction(async (t) => {
         const matchRef = db.collection("matches").doc(matchId);
         const userRef  = db.collection("users").doc(uid);
-        const [matchDoc, userDoc] = await Promise.all([
-          t.get(matchRef),
-          t.get(userRef),
-        ]);
+        const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
 
         if (!matchDoc.exists) throw new Error("Match no longer exists");
         if (!userDoc.exists)  throw new Error("User not found");
@@ -711,7 +823,7 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
 
         if (match.status    !== "waiting") throw new Error("Match no longer available");
         if (match.playerA   === uid)       throw new Error("Cannot join your own match");
-        if (match.playerB   != null)       throw new Error("Match already taken — try again");
+        if (match.playerB   != null)       throw new Error("Match already taken");
         if (match.isPrivate === true)      throw new Error("Cannot join a private match");
         if (coins < match.entryFee)        throw new Error("Insufficient coins");
 
@@ -812,8 +924,7 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
       if (hasSubmittedResult(match))
         throw new Error("Result already submitted");
 
-      const opponentUid =
-        uid === match.playerA ? match.playerB : match.playerA;
+      const opponentUid = uid === match.playerA ? match.playerB : match.playerA;
 
       t.update(matchRef, {
         result: {
@@ -854,14 +965,10 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       if (match.playerA !== uid && match.playerB !== uid)
         throw new Error("You are not in this match");
-      if (match.status === "completed")
-        throw new Error("Match already completed");
-      if (match.status !== "active")
-        throw new Error("Match is not active");
-      if (!hasSubmittedResult(match))
-        throw new Error("No result submitted yet");
-      if (match.submittedBy === uid)
-        throw new Error("You submitted — wait for opponent");
+      if (match.status === "completed") throw new Error("Match already completed");
+      if (match.status !== "active")   throw new Error("Match is not active");
+      if (!hasSubmittedResult(match))  throw new Error("No result submitted yet");
+      if (match.submittedBy === uid)   throw new Error("You submitted — wait for opponent");
 
       const submitter      = match.submittedBy;
       const confirmer      = uid;
@@ -906,11 +1013,8 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
 
     const batch = db.batch();
     batch.set(db.collection("disputes").doc(), {
-      matchId,
-      reportedBy: uid,
-      reason,
-      matchData:  match,
-      createdAt:  admin.firestore.FieldValue.serverTimestamp(),
+      matchId, reportedBy: uid, reason, matchData: match,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     batch.update(matchRef, {
       status:     "disputed",
@@ -927,7 +1031,6 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
 
 app.get("/matches/history", verifyToken, async (req, res) => {
   const uid = req.user.uid;
-
   try {
     const [snapA, snapB] = await Promise.all([
       db.collection("matches").where("playerA", "==", uid).where("status", "in", ["completed", "cancelled", "disputed"]).orderBy("createdAt", "desc").limit(50).get(),
@@ -937,23 +1040,13 @@ app.get("/matches/history", verifyToken, async (req, res) => {
     const history = [
       ...snapA.docs.map((d) => d.data()),
       ...snapB.docs.map((d) => d.data()),
-    ]
-      .sort((a, b) => {
-        const aT = a.createdAt?._seconds ?? 0;
-        const bT = b.createdAt?._seconds ?? 0;
-        return bT - aT;
-      })
-      .slice(0, 50);
+    ].sort((a, b) => (b.createdAt?._seconds ?? 0) - (a.createdAt?._seconds ?? 0)).slice(0, 50);
 
     res.json(history);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ═══════════════════════════════════════════════════════════════
-// TIMER EXPIRY
-// ═══════════════════════════════════════════════════════════════
 
 app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
   const { matchId } = req.body;
@@ -970,8 +1063,7 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       const match = matchDoc.data();
 
       if (match.status === "completed" || match.rewarded || match.autoResolved) {
-        result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true };
-        return;
+        result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true }; return;
       }
       if (match.status === "cancelled") { result = { alreadyCancelled: true }; return; }
       if (match.status !== "active")
@@ -981,7 +1073,7 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
 
       const scoreOf        = match.result?.scoreOf ?? {};
       const submitter      = match.submittedBy;
-      const other = submitter === match.playerA ? match.playerB : match.playerA;
+      const other          = submitter === match.playerA ? match.playerB : match.playerA;
       const submitterScore = scoreOf[submitter] ?? 0;
       const otherScore     = scoreOf[other]     ?? 0;
 
@@ -1020,8 +1112,7 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const match = matchDoc.data();
 
       if (match.status === "cancelled" || match.status === "completed") {
-        alreadyDone = true;
-        return;
+        alreadyDone = true; return;
       }
       if (match.status !== "active")
         throw new Error(`Cannot auto-cancel — status is "${match.status}"`);
@@ -1030,13 +1121,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
 
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
-      const [playerA_Doc, playerB_Doc] = await Promise.all([
-        t.get(playerA_Ref),
-        t.get(playerB_Ref),
-      ]);
+      const [playerA_Doc, playerB_Doc] = await Promise.all([t.get(playerA_Ref), t.get(playerB_Ref)]);
 
-      if (!playerA_Doc.exists || !playerB_Doc.exists)
-        throw new Error("Player data not found");
+      if (!playerA_Doc.exists || !playerB_Doc.exists) throw new Error("Player data not found");
 
       t.update(playerA_Ref, { coins: inc(playerA_Doc.data().coins, match.entryFee) });
       t.update(playerB_Ref, { coins: inc(playerB_Doc.data().coins, match.entryFee) });
@@ -1055,10 +1142,6 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// REMATCH SYSTEM
-// ═══════════════════════════════════════════════════════════════
-
 app.post("/matches/rematch-request", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   const uid = req.user.uid;
@@ -1074,12 +1157,10 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
       if (!userDoc.exists)  throw new Error("User not found");
 
       const match = matchDoc.data();
-      if (match.playerA !== uid && match.playerB !== uid)
-        throw new Error("You are not in this match");
-      if (match.status !== "completed") throw new Error("Match not completed");
-      if (match.rematchRequestedBy)     throw new Error("Rematch already requested");
-      if ((userDoc.data().coins ?? 0) < match.entryFee)
-        throw new Error("Insufficient coins for rematch");
+      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
+      if (match.status !== "completed")  throw new Error("Match not completed");
+      if (match.rematchRequestedBy)      throw new Error("Rematch already requested");
+      if ((userDoc.data().coins ?? 0) < match.entryFee) throw new Error("Insufficient coins for rematch");
 
       t.update(matchRef, {
         rematchRequestedBy: uid,
@@ -1116,19 +1197,13 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
       if (!matchDoc.exists) throw new Error("Match not found");
 
       const match = matchDoc.data();
-      if (match.playerA !== uid && match.playerB !== uid)
-        throw new Error("You are not in this match");
-      if (match.rematchStatus !== "pending")
-        throw new Error("No pending rematch");
-      if (match.rematchRequestedBy === uid)
-        throw new Error("Cannot accept own rematch request");
+      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
+      if (match.rematchStatus !== "pending")   throw new Error("No pending rematch");
+      if (match.rematchRequestedBy === uid)    throw new Error("Cannot accept own rematch request");
 
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
-      const [playerA_Doc, playerB_Doc] = await Promise.all([
-        t.get(playerA_Ref),
-        t.get(playerB_Ref),
-      ]);
+      const [playerA_Doc, playerB_Doc] = await Promise.all([t.get(playerA_Ref), t.get(playerB_Ref)]);
 
       const coinsA = playerA_Doc.data()?.coins ?? 0;
       const coinsB = playerB_Doc.data()?.coins ?? 0;
@@ -1169,9 +1244,6 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────
-// LEADERBOARD
-// ─────────────────────────────────────────
 app.get("/leaderboard", verifyToken, async (req, res) => {
   try {
     const snap = await db.collection("users").orderBy("wins", "desc").limit(20).get();
@@ -1193,9 +1265,6 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
   }
 });
 
-// ═══════════════════════════════════════════════════════════════
-// START
-// ═══════════════════════════════════════════════════════════════
 const PORT = process.env.PORT || 4000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Duelix backend running on port ${PORT}`);

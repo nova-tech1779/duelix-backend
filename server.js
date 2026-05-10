@@ -183,6 +183,47 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 }
 
 // ─────────────────────────────────────────
+// DISPUTE CATEGORY VALIDATOR
+// Keeps server and client in sync.
+// ─────────────────────────────────────────
+const VALID_DISPUTE_REASONS = [
+  "Wrong Score",
+  "Opponent Quit",
+  "Fake Submission",
+  "Time Wasting",
+  "Abuse",
+  "Other Issue",
+];
+
+function validateDisputeReason(reason) {
+  if (!reason || typeof reason !== "string") {
+    throw new Error("reason is required");
+  }
+  const trimmed = reason.trim();
+  if (!VALID_DISPUTE_REASONS.includes(trimmed)) {
+    // Still accept legacy reasons from older clients gracefully
+    console.warn(`[dispute] Non-standard reason received: "${trimmed}" — accepted`);
+  }
+  if (trimmed.length < 2 || trimmed.length > 200) {
+    throw new Error("reason must be between 2 and 200 characters");
+  }
+  return trimmed;
+}
+
+function validateDisputeNote(note) {
+  if (!note) return "";
+  const trimmed = String(note).trim();
+  if (trimmed.length > 500) {
+    throw new Error("note must be 500 characters or fewer");
+  }
+  const wordCount = trimmed === "" ? 0 : trimmed.split(/\s+/).length;
+  if (wordCount > 20) {
+    throw new Error("note must be 20 words or fewer");
+  }
+  return trimmed;
+}
+
+// ─────────────────────────────────────────
 // HEALTH
 // ─────────────────────────────────────────
 app.get("/",       (_req, res) => res.send("Duelix backend is live 🚀"));
@@ -194,7 +235,6 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ─────────────────────────────────────────
 // CREATE USER PROFILE — protected, idempotent
-// Generates a unique referral code on first creation.
 // ─────────────────────────────────────────
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -225,7 +265,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
       const snap = await t.get(userRef);
       if (snap.exists) return; // idempotent
 
-      // Duplicate phone guard
       const phoneSnap = await db
         .collection("users")
         .where("phone", "==", phone)
@@ -233,7 +272,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         .get();
       if (!phoneSnap.empty) throw new Error("PHONE_TAKEN");
 
-      // Duplicate username guard
       const nameSnap = await db
         .collection("users")
         .where("displayName", "==", name)
@@ -246,7 +284,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         displayName:  name,
         phone,
         email:        email ?? "",
-        coins:        20,              // base sign-up bonus
+        coins:        20,
         wins:         0,
         losses:       0,
         draws:        0,
@@ -254,7 +292,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         loginStreak:  0,
         lastLogin:    null,
         avatar:       "assets/avatars/avatar1.png",
-        referralCode,                  // DUEL-XXXXXX
+        referralCode,
         referredBy:   null,
         referralCount: 0,
         createdAt:    admin.firestore.FieldValue.serverTimestamp(),
@@ -289,20 +327,6 @@ app.get("/user-exists/:uid", async (req, res) => {
 // ═══════════════════════════════════════════════════════════════
 // REFERRAL SYSTEM
 // ═══════════════════════════════════════════════════════════════
-
-// POST /apply-referral
-// Body: { referralCode: string }
-// Auth: Bearer token (currentUid from token)
-//
-// Rewards:
-//   New user  → +10 coins  (on top of the 20 sign-up bonus = 30 total)
-//   Referrer  → +15 coins
-//
-// Rules:
-//   • Code must exist
-//   • Cannot self-refer
-//   • Can only apply once (referredBy must be null)
-// ─────────────────────────────────────────
 app.post("/apply-referral", verifyToken, async (req, res) => {
   const currentUid = req.user.uid;
   const { referralCode } = req.body;
@@ -314,7 +338,6 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
   const code = referralCode.trim().toUpperCase();
 
   try {
-    // Find referrer by code
     const codeSnap = await db
       .collection("users")
       .where("referralCode", "==", code)
@@ -328,7 +351,6 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
     const referrerDoc = codeSnap.docs[0];
     const referrerUid = referrerDoc.id;
 
-    // Self-referral guard
     if (referrerUid === currentUid) {
       return res.status(400).json({ error: "You cannot use your own referral code" });
     }
@@ -344,26 +366,23 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
         t.get(referrerRef),
       ]);
 
-      if (!currentDoc.exists)  throw new Error("Your account was not found");
+      if (!currentDoc.exists)   throw new Error("Your account was not found");
       if (!referrerDocT.exists) throw new Error("Referrer account not found");
 
       const currentData  = currentDoc.data();
       const referrerData = referrerDocT.data();
 
-      // Already used a referral code
       if (currentData.referredBy) {
         throw new Error("ALREADY_REFERRED");
       }
 
-      bonusCoins = 10; // referral bonus for new user
+      bonusCoins = 10;
 
-      // Credit new user
       t.update(currentRef, {
         coins:      inc(currentData.coins, bonusCoins),
         referredBy: referrerUid,
       });
 
-      // Credit referrer
       t.update(referrerRef, {
         coins:         inc(referrerData.coins, 15),
         referralCount: inc(referrerData.referralCount ?? 0),
@@ -397,9 +416,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────
-// UPDATE DISPLAY NAME — with uniqueness check
-// ─────────────────────────────────────────
 app.post("/update-name", verifyToken, async (req, res) => {
   const { displayName } = req.body;
   if (!displayName)
@@ -413,7 +429,6 @@ app.post("/update-name", verifyToken, async (req, res) => {
   }
 
   try {
-    // Check uniqueness (exclude own doc)
     const snap = await db
       .collection("users")
       .where("displayName", "==", name)
@@ -449,9 +464,6 @@ app.post("/update-avatar", verifyToken, async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────
-// CHECK USERNAME AVAILABILITY
-// ─────────────────────────────────────────
 app.get("/check-username/:username", verifyToken, async (req, res) => {
   const { username } = req.params;
   try {
@@ -460,9 +472,7 @@ app.get("/check-username/:username", verifyToken, async (req, res) => {
       .where("displayName", "==", username)
       .limit(1)
       .get();
-    // Available if empty OR the only match is the requesting user themselves
-    const available =
-      snap.empty || snap.docs[0].id === req.user.uid;
+    const available = snap.empty || snap.docs[0].id === req.user.uid;
     res.json({ available });
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -990,41 +1000,133 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════
+// DISPUTE
+//
+// CHANGES from original:
+//   • Accepts optional `note` (max 20 words / 500 chars)
+//   • Accepts optional `evidenceImage` URL (pre-uploaded by client)
+//   • Both are validated and stored in the dispute document
+//   • Duplicate dispute guard: returns 409 if match is already disputed
+//   • Match is frozen: status → "disputed", all reward/rematch fields
+//     are preserved unchanged (backend doesn't clear coins here)
+//   • Dispute document now contains the full enriched structure
+// ═══════════════════════════════════════════════════════════════
 app.post("/matches/dispute", verifyToken, async (req, res) => {
-  const { matchId, reason } = req.body;
   const uid = req.user.uid;
+  const { matchId, reason, note, evidenceImage } = req.body;
 
-  if (!matchId || !reason)
-    return res.status(400).json({ error: "matchId and reason required" });
+  // ── Input validation ──────────────────────
+  if (!matchId) {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+
+  let validatedReason;
+  try {
+    validatedReason = validateDisputeReason(reason);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  // note is optional; only validate if provided
+  let validatedNote = "";
+  if (note !== undefined && note !== null && note !== "") {
+    try {
+      validatedNote = validateDisputeNote(note);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
+
+  // evidenceImage must be a URL string if provided
+  let validatedEvidence = "";
+  if (evidenceImage) {
+    if (typeof evidenceImage !== "string" || evidenceImage.length > 2000) {
+      return res.status(400).json({ error: "evidenceImage must be a valid URL string" });
+    }
+    validatedEvidence = evidenceImage.trim();
+  }
 
   try {
     const matchRef = db.collection("matches").doc(matchId);
     const matchDoc = await matchRef.get();
 
-    if (!matchDoc.exists)
+    if (!matchDoc.exists) {
       return res.status(404).json({ error: "Match not found" });
+    }
 
     const match = matchDoc.data();
 
-    if (match.playerA !== uid && match.playerB !== uid)
+    // ── Authorization ─────────────────────────
+    if (match.playerA !== uid && match.playerB !== uid) {
       return res.status(403).json({ error: "You are not in this match" });
-    if (match.status === "completed")
-      return res.status(400).json({ error: "Match already completed" });
+    }
 
-    const batch = db.batch();
-    batch.set(db.collection("disputes").doc(), {
-      matchId, reportedBy: uid, reason, matchData: match,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    // ── Duplicate dispute guard ───────────────
+    if (match.status === "disputed") {
+      return res.status(409).json({ error: "This match has already been disputed" });
+    }
+
+    // ── State guard ───────────────────────────
+    if (match.status === "completed") {
+      return res.status(400).json({ error: "Match is already completed — cannot dispute" });
+    }
+    if (match.status === "cancelled") {
+      return res.status(400).json({ error: "Match is cancelled — cannot dispute" });
+    }
+
+    const now = admin.firestore.FieldValue.serverTimestamp();
+
+    // ── Atomic batch: freeze match + create dispute doc ──
+    const batch     = db.batch();
+    const disputeRef = db.collection("disputes").doc();
+
+    // Dispute document — full production structure
+    batch.set(disputeRef, {
+      id:             disputeRef.id,
+      matchId,
+      disputeReason:  validatedReason,
+      disputeNote:    validatedNote,
+      evidenceImage:  validatedEvidence,
+      reportedBy:     uid,
+      disputedBy:     uid,
+      status:         "pending",        // pending | resolved | dismissed
+      resolvedBy:     null,
+      resolvedAt:     null,
+      resolutionNote: null,
+      matchData: {
+        playerA:      match.playerA,
+        playerB:      match.playerB,
+        game:         match.game,
+        entryFee:     match.entryFee,
+        submittedBy:  match.submittedBy ?? null,
+        result:       match.result      ?? null,
+      },
+      createdAt: now,
     });
+
+    // Freeze match — rewards, rematch, and result edits are all blocked
+    // while status === "disputed". No coins are moved here.
     batch.update(matchRef, {
       status:     "disputed",
-      disputedAt: admin.firestore.FieldValue.serverTimestamp(),
+      disputedAt: now,
       disputedBy: uid,
+      disputeId:  disputeRef.id,  // easy back-reference from match doc
     });
+
     await batch.commit();
 
-    res.json({ message: "Dispute submitted — under review" });
+    console.log(
+      `[dispute] matchId=${matchId} reason="${validatedReason}" ` +
+      `note="${validatedNote}" evidence=${!!validatedEvidence} uid=${uid}`
+    );
+
+    res.json({
+      message:   "Dispute submitted — under review",
+      disputeId: disputeRef.id,
+    });
   } catch (err) {
+    console.error("[dispute]", err.message);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1227,6 +1329,7 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         confirmedAt:        null,
         disputedAt:         null,
         disputedBy:         null,
+        disputeId:          null,
         autoResolved:       false,
         autoCancelled:      false,
         cancelReason:       null,
@@ -1265,7 +1368,7 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 4000;
+const PORT   = process.env.PORT || 4000;
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Duelix backend running on port ${PORT}`);
 });

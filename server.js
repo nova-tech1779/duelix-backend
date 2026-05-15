@@ -1,4 +1,3 @@
-
 const express = require("express");
 const cors    = require("cors");
 const dotenv  = require("dotenv");
@@ -29,9 +28,6 @@ app.use(cors({
 
 app.use(express.json());
 
-// ─────────────────────────────────────────
-// CACHE CONTROL
-// ─────────────────────────────────────────
 app.use((_req, res, next) => {
   res.set({
     "Cache-Control":     "no-store, no-cache, must-revalidate, proxy-revalidate",
@@ -92,7 +88,6 @@ function validateEntryFee(entryFee) {
   }
 }
 
-// FIX: scores must be non-negative integers — prevents -1 or 1.5 scores
 function validateScore(value, label) {
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error(label + " must be a non-negative integer");
@@ -104,40 +99,11 @@ function hasSubmittedResult(match) {
 }
 
 // ─────────────────────────────────────────
-// TRUST SYSTEM HELPERS
-//
-// Base Trust Score Formula:
-//   trust = 80   (base starts at 80 — trust grows progressively via cleanMatchBonus)
-//     - (rageQuits        x 10)
-//     - (fakeResults      x 20)
-//     - (disputesLost     x  8)
-//     - (cancelledMatches x  3)
-//     - (reportsReceived  x  2)
-//     + cleanMatchBonus
-//   clamped to [0, 100]
-//
-// Clean Match Trust Reward (applied after confirmed clean match):
-//   +0.5  result submitted successfully
-//   +1.0  opponent confirms result
-//   +0.5  no dispute after completion
-//   = +2.0 total trust bonus per clean match
-//   = +0.5 fair play bonus per clean match
-//
-// Fair Play Rating Formula:
-//   fairPlay = 100
-//     - (fakeResults  x 20)
-//     - (disputesLost x 10)
-//     - (rageQuits    x  5)
-//     + fairPlayBonus
-//   clamped to [0, 100] — never exceeds 100
-//
-// Match Completion Rate:
-//   completedMatches / totalMatches x 100
-//   Returns 0 when totalMatches === 0
+// TRUST SYSTEM
 // ─────────────────────────────────────────
 
-const CLEAN_MATCH_TRUST_BONUS    = 2;    // +2 trust score per clean match
-const CLEAN_MATCH_FAIRPLAY_BONUS = 0.5;  // +0.5 fair play per clean match
+const CLEAN_MATCH_TRUST_BONUS    = 2;
+const CLEAN_MATCH_FAIRPLAY_BONUS = 0.5;
 
 function computeTrustScore(data) {
   const rageQuits        = Number(data.rageQuits)        || 0;
@@ -147,7 +113,6 @@ function computeTrustScore(data) {
   const reportsReceived  = Number(data.reportsReceived)  || 0;
   const cleanMatchBonus  = Number(data.cleanMatchBonus)  || 0;
 
-  // Base is 80: new users start here, trust grows via cleanMatchBonus
   const raw = 80
     - (rageQuits        * 10)
     - (fakeResults      * 20)
@@ -181,7 +146,6 @@ function computeFairPlayRating(data) {
   return Math.max(0, Math.min(100, Math.round(base)));
 }
 
-// Default trust fields for new user profiles.
 const DEFAULT_TRUST_FIELDS = {
   trustScore:          80,
   completedMatches:    0,
@@ -198,11 +162,6 @@ const DEFAULT_TRUST_FIELDS = {
   friendRequests:      true,
 };
 
-/**
- * Recalculates and writes trust fields for a user.
- * Used for penalty paths (rage quit, dispute, fake result).
- * Does NOT apply the clean match reward.
- */
 function applyTrustUpdate(t, userRef, userData) {
   const score      = computeTrustScore(userData);
   const completion = computeCompletionRate(userData);
@@ -224,12 +183,6 @@ function applyTrustUpdate(t, userRef, userData) {
   }
 }
 
-/**
- * Applies the clean match trust reward for a single player.
- * Called after a confirmed clean match (no dispute).
- * Reward: +2 trust score, +0.5 fair play rating.
- * Both clamped to [0, 100] — fair play never exceeds 100.
- */
 function applyCleanMatchReward(t, userRef, userData) {
   const newCleanMatchBonus = (Number(userData.cleanMatchBonus) || 0) + CLEAN_MATCH_TRUST_BONUS;
   const newFairPlayBonus   = (Number(userData.fairPlayBonus)   || 0) + CLEAN_MATCH_FAIRPLAY_BONUS;
@@ -292,12 +245,353 @@ function validateDisputeNote(note) {
   return trimmed;
 }
 
+// ═══════════════════════════════════════════════════════════════
+// FCM PUSH HELPER
+// ═══════════════════════════════════════════════════════════════
+async function sendPushNotification(userId, title, body, data) {
+  if (!userId || typeof userId !== "string") return;
+
+  try {
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (!userDoc.exists) return;
+
+    const fcmToken = userDoc.data().fcmToken;
+    if (!fcmToken || typeof fcmToken !== "string") return;
+
+    const safeData = {};
+    if (data && typeof data === "object") {
+      Object.keys(data).forEach((k) => {
+        const v = data[k];
+        if (v != null) safeData[k] = String(v);
+      });
+    }
+    safeData.type         = safeData.type || "general";
+    safeData.click_action = "FLUTTER_NOTIFICATION_CLICK";
+
+    const message = {
+      token: fcmToken,
+      notification: {
+        title: String(title || ""),
+        body:  String(body  || ""),
+      },
+      data: safeData,
+      android: {
+        priority: "high",
+        notification: {
+          sound:        "default",
+          click_action: "FLUTTER_NOTIFICATION_CLICK",
+        },
+      },
+      apns: {
+        payload: {
+          aps: {
+            sound: "default",
+            badge: 1,
+          },
+        },
+      },
+      webpush: {
+        notification: {
+          icon:    "/icons/icon-192x192.png",
+          badge:   "/icons/badge-72x72.png",
+          vibrate: [200, 100, 200],
+        },
+        fcm_options: {
+          link: "https://duelix-app.web.app",
+        },
+      },
+    };
+
+    await admin.messaging().send(message);
+    console.log("[sendPush] sent uid=" + userId);
+
+  } catch (err) {
+    const staleErrors = [
+      "messaging/registration-token-not-registered",
+      "messaging/invalid-registration-token",
+    ];
+    const code = err.errorInfo && err.errorInfo.code ? err.errorInfo.code : "";
+    if (staleErrors.includes(code)) {
+      console.warn("[sendPush] stale token cleared for uid=" + userId);
+      db.collection("users").doc(userId)
+        .update({ fcmToken: admin.firestore.FieldValue.delete() })
+        .catch((e) => console.error("[sendPush] token cleanup error:", e.message));
+    } else {
+      console.error("[sendPush] uid=" + userId + " err=" + err.message);
+    }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATION SYSTEM
+// ═══════════════════════════════════════════════════════════════
+
+function notificationFilterTag(type) {
+  const matchTypes = [
+    "match_found", "match_joined", "match_created", "match_cancelled",
+    "match_refunded", "match_result_submitted", "match_result_confirmed",
+    "match_won", "match_lost", "match_draw", "match_auto_resolved",
+    "match_auto_cancelled", "match_dispute_opened", "match_dispute_resolved",
+    "rematch_requested", "rematch_accepted", "rematch_declined", "match_result",
+  ];
+  const rewardTypes = [
+    "coins_added", "daily_reward", "reward_payout",
+    "purchase_successful", "redeem_successful", "reward",
+  ];
+  const socialTypes   = ["friend_request", "friend_accepted", "chat_message"];
+  const referralTypes = ["referral"];
+  if (matchTypes.includes(type))    return "match";
+  if (rewardTypes.includes(type))   return "reward";
+  if (socialTypes.includes(type))   return "social";
+  if (referralTypes.includes(type)) return "referral";
+  return "system";
+}
+
+async function createNotification(userId, type, title, message, meta) {
+  if (!userId || typeof userId !== "string") return;
+  const safeMeta = (meta && typeof meta === "object") ? meta : {};
+  try {
+    const ref = db.collection("notifications").doc();
+    await ref.set({
+      id:        ref.id,
+      userId,
+      type,
+      filterTag: notificationFilterTag(type),
+      title,
+      message,
+      isRead:    false,
+      pushSent:  false,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      meta:      safeMeta,
+    });
+  } catch (err) {
+    console.error("[createNotification] type=" + type + " uid=" + userId + " err=" + err.message);
+  }
+}
+
+async function notifyUser(userId, type, title, message, meta) {
+  await createNotification(userId, type, title, message, meta || {});
+  const pushData = Object.assign({}, (meta && typeof meta === "object") ? meta : {}, { type });
+  await sendPushNotification(userId, title, message, pushData);
+}
+
+async function notifyPushOnly(userId, title, body, data) {
+  if (!userId || typeof userId !== "string") return;
+  await sendPushNotification(userId, title, body, data || {});
+}
+
+async function notifyMultipleUsers(userIds, type, title, message, meta) {
+  if (!Array.isArray(userIds)) return;
+  await Promise.all(
+    userIds
+      .filter((uid) => uid && typeof uid === "string")
+      .map((uid) => notifyUser(uid, type, title, message, meta || {}))
+  );
+}
+
+function notifyMatchCreated(userId, matchId, game, entryFee) {
+  return notifyUser(
+    userId,
+    "match_created",
+    "Match created! ⚔️",
+    "Your " + game + " match (entry: " + entryFee + " coins) is live and waiting for an opponent.",
+    { matchId: matchId, game: game, entryFee: entryFee }
+  );
+}
+
+function notifyMatchJoined(playerAUid, playerBUid, matchId, game) {
+  return notifyMultipleUsers(
+    [playerAUid, playerBUid],
+    "match_joined",
+    "Match started! 🎮",
+    "Your " + game + " match has started. Good luck!",
+    { matchId: matchId, game: game }
+  );
+}
+
+function notifyResultSubmitted(opponentUid, matchId) {
+  return notifyUser(
+    opponentUid,
+    "match_result_submitted",
+    "Result submitted ⏳",
+    "Your opponent submitted a result. Confirm within 3 minutes or the match will be auto-resolved.",
+    { matchId: matchId }
+  );
+}
+
+function notifyMatchWon(userId, matchId, coinsWon) {
+  return notifyUser(
+    userId,
+    "match_won",
+    "Victory! 🏆",
+    "You won your match. +" + coinsWon + " coins added to your account.",
+    { matchId: matchId, coinsWon: coinsWon }
+  );
+}
+
+function notifyMatchLost(userId, matchId, coinsBack) {
+  return notifyUser(
+    userId,
+    "match_lost",
+    "Match over 😔",
+    "You lost this match. You received " + coinsBack + " coins back. Keep going!",
+    { matchId: matchId, coinsBack: coinsBack }
+  );
+}
+
+function notifyMatchDraw(userId, matchId, coinsBack) {
+  return notifyUser(
+    userId,
+    "match_draw",
+    "It's a draw! 🤝",
+    "Match ended in a draw. Your entry fee of " + coinsBack + " coins has been refunded.",
+    { matchId: matchId, coinsBack: coinsBack }
+  );
+}
+
+function notifyMatchCancelled(userId, matchId, refund) {
+  return notifyUser(
+    userId,
+    "match_cancelled",
+    "Match cancelled ❌",
+    "Your match was cancelled. " + refund + " coins have been refunded.",
+    { matchId: matchId, refund: refund }
+  );
+}
+
+function notifyAutoCancelled(userId, matchId, refund) {
+  return notifyUser(
+    userId,
+    "match_auto_cancelled",
+    "Match auto-cancelled ⚡",
+    "Your match expired with no result submitted. " + refund + " coins refunded.",
+    { matchId: matchId, refund: refund }
+  );
+}
+
+function notifyAutoResolved(userId, matchId, outcome) {
+  return notifyUser(
+    userId,
+    "match_auto_resolved",
+    "Match auto-resolved ⚡",
+    "Your match was resolved automatically. Outcome: " + outcome + ".",
+    { matchId: matchId, outcome: outcome }
+  );
+}
+
+function notifyDisputeOpened(userId, matchId) {
+  return notifyUser(
+    userId,
+    "match_dispute_opened",
+    "Dispute opened ⚠️",
+    "A dispute has been raised for your match. Our review team will investigate shortly.",
+    { matchId: matchId }
+  );
+}
+
+function notifyDisputeResolved(userId, matchId, outcome) {
+  return notifyUser(
+    userId,
+    "match_dispute_resolved",
+    "Dispute resolved 🛡️",
+    "Your match dispute has been resolved. Outcome: " + outcome + ".",
+    { matchId: matchId, outcome: outcome }
+  );
+}
+
+function notifyRematchRequested(opponentUid, matchId) {
+  return notifyUser(
+    opponentUid,
+    "rematch_requested",
+    "Rematch requested 🔄",
+    "Your opponent wants a rematch. Accept or decline in the match room.",
+    { matchId: matchId }
+  );
+}
+
+function notifyRematchAccepted(userId, matchId) {
+  return notifyUser(
+    userId,
+    "rematch_accepted",
+    "Rematch accepted 🎮",
+    "Your rematch has started. Good luck!",
+    { matchId: matchId }
+  );
+}
+
+function notifyRematchDeclined(userId, matchId) {
+  return notifyUser(
+    userId,
+    "rematch_declined",
+    "Rematch declined 🚫",
+    "Your opponent declined the rematch request.",
+    { matchId: matchId }
+  );
+}
+
+function notifyDailyReward(userId, coins, streak) {
+  return notifyUser(
+    userId,
+    "daily_reward",
+    "Daily reward claimed! 💰",
+    "You claimed " + coins + " coins. You are on a " + streak + " day streak -- keep it up!",
+    { coins: coins, streak: streak }
+  );
+}
+
+function notifyReferralBonus(userId, bonusCoins, referrerName) {
+  return notifyUser(
+    userId,
+    "referral",
+    "Referral bonus unlocked! 🎁",
+    "You used " + referrerName + "'s referral code and earned +" + bonusCoins + " bonus coins. Welcome to Duelix!",
+    { bonusCoins: bonusCoins, referrerName: referrerName, event: "new_user_bonus" }
+  );
+}
+
+function notifyReferrerReward(referrerUid, rewardCoins, newUserName) {
+  return notifyUser(
+    referrerUid,
+    "referral",
+    "Someone used your code! 🎉",
+    newUserName + " just signed up with your referral code. You earned +" + rewardCoins + " coins!",
+    { rewardCoins: rewardCoins, newUserName: newUserName, event: "referrer_reward" }
+  );
+}
+
+function notifyChatMessage(recipientUid, senderName, matchId, preview) {
+  const safePreview = typeof preview === "string" && preview.length > 0
+    ? (preview.length > 60 ? preview.substring(0, 57) + "..." : preview)
+    : "Sent you a message";
+  return notifyPushOnly(
+    recipientUid,
+    senderName + " 💬",
+    safePreview,
+    { matchId: matchId, senderName: senderName, type: "chat_message" }
+  );
+}
+
+function notifyRoomTimer(userId, matchId, alertType) {
+  const titles = {
+    "5min":    "5 minutes remaining ⏱️",
+    "1min":    "1 minute remaining! ⏱️",
+    "expired": "Match room expired ⚡",
+  };
+  const messages = {
+    "5min":    "Your match room expires in 5 minutes. Submit your result now.",
+    "1min":    "Last chance! Submit your result before the match room expires.",
+    "expired": "Your match room has expired and has been auto-resolved by the system.",
+  };
+  return notifyPushOnly(
+    userId,
+    titles[alertType]   || "Match timer alert",
+    messages[alertType] || "",
+    { matchId: matchId, timerAlert: alertType, type: "room_timer" }
+  );
+}
+
 // ─────────────────────────────────────────
-// DISTRIBUTE MATCH REWARD
-//
-// Called from confirm-result (clean path — both players agreed).
-// Distributes coins, increments match counters, applies clean
-// match trust reward (+2 trust, +0.5 fair play) to BOTH players.
+// REWARD DISTRIBUTION — CONFIRM-RESULT PATH
 // ─────────────────────────────────────────
 async function distributeReward(t, match, matchRef, confirmedWinner) {
   const winner = winnerReward(match.entryFee);
@@ -308,7 +602,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
   const playerB_Ref = db.collection("users").doc(match.playerB);
   const platformRef = db.collection("platform").doc("earnings");
 
-  // All reads before any writes
   const [playerA_Doc, playerB_Doc, platformDoc] = await Promise.all([
     t.get(playerA_Ref),
     t.get(playerB_Ref),
@@ -367,15 +660,15 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     });
 
     t.update(winnerRef, {
-      coins:            inc(winnerData.coins        != null ? winnerData.coins        : 0, winner),
-      wins:             inc(winnerData.wins         != null ? winnerData.wins         : 0),
-      totalMatches:     inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0),
+      coins:            inc(winnerData.coins            != null ? winnerData.coins            : 0, winner),
+      wins:             inc(winnerData.wins             != null ? winnerData.wins             : 0),
+      totalMatches:     inc(winnerData.totalMatches     != null ? winnerData.totalMatches     : 0),
       completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0),
     });
     t.update(loserRef, {
-      coins:            inc(loserData.coins        != null ? loserData.coins        : 0, loser),
-      losses:           inc(loserData.losses       != null ? loserData.losses       : 0),
-      totalMatches:     inc(loserData.totalMatches != null ? loserData.totalMatches : 0),
+      coins:            inc(loserData.coins            != null ? loserData.coins            : 0, loser),
+      losses:           inc(loserData.losses           != null ? loserData.losses           : 0),
+      totalMatches:     inc(loserData.totalMatches     != null ? loserData.totalMatches     : 0),
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
@@ -408,12 +701,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 }
 
 // ─────────────────────────────────────────
-// DISTRIBUTE MATCH REWARD — AUTO-RESOLVE PATH
-//
-// Used when the non-submitter rage quit.
-// Only the submitter receives the clean match trust reward.
-// The rage quitter receives a penalty via applyTrustUpdate instead.
-// nonSubmitterUid: the player who failed to respond (rage quit).
+// REWARD DISTRIBUTION — AUTO-RESOLVE PATH
 // ─────────────────────────────────────────
 async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, nonSubmitterUid) {
   const winner = winnerReward(match.entryFee);
@@ -424,7 +712,6 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
   const playerB_Ref = db.collection("users").doc(match.playerB);
   const platformRef = db.collection("platform").doc("earnings");
 
-  // All reads before writes
   const [playerA_Doc, playerB_Doc, platformDoc] = await Promise.all([
     t.get(playerA_Ref),
     t.get(playerB_Ref),
@@ -439,7 +726,6 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
-    // Draw on auto-resolve: both players submitted so both get clean reward
     const aUpdated = Object.assign({}, playerA_Data, {
       completedMatches: inc(playerA_Data.completedMatches),
       totalMatches:     inc(playerA_Data.totalMatches),
@@ -484,19 +770,18 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     });
 
     t.update(winnerRef, {
-      coins:            inc(winnerData.coins        != null ? winnerData.coins        : 0, winner),
-      wins:             inc(winnerData.wins         != null ? winnerData.wins         : 0),
-      totalMatches:     inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0),
+      coins:            inc(winnerData.coins            != null ? winnerData.coins            : 0, winner),
+      wins:             inc(winnerData.wins             != null ? winnerData.wins             : 0),
+      totalMatches:     inc(winnerData.totalMatches     != null ? winnerData.totalMatches     : 0),
       completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0),
     });
     t.update(loserRef, {
-      coins:            inc(loserData.coins        != null ? loserData.coins        : 0, loser),
-      losses:           inc(loserData.losses       != null ? loserData.losses       : 0),
-      totalMatches:     inc(loserData.totalMatches != null ? loserData.totalMatches : 0),
+      coins:            inc(loserData.coins            != null ? loserData.coins            : 0, loser),
+      losses:           inc(loserData.losses           != null ? loserData.losses           : 0),
+      totalMatches:     inc(loserData.totalMatches     != null ? loserData.totalMatches     : 0),
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    // Only reward the player who is NOT the rage-quitter
     if (confirmedWinner !== nonSubmitterUid) {
       applyCleanMatchReward(t, winnerRef, winnerUpdated);
     }
@@ -536,11 +821,37 @@ app.get("/",       (_req, res) => res.send("Duelix backend is live"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // ═══════════════════════════════════════════════════════════════
+// SAVE FCM TOKEN
+// ═══════════════════════════════════════════════════════════════
+app.post("/save-fcm-token", verifyToken, async (req, res) => {
+  const uid       = req.user.uid;
+  const { token } = req.body;
+
+  if (!token || typeof token !== "string" || !token.trim()) {
+    return res.status(400).json({ error: "token is required" });
+  }
+
+  const safeToken = token.trim();
+
+  try {
+    await db.collection("users").doc(uid).update({
+      fcmToken:          safeToken,
+      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log("[save-fcm-token] saved uid=" + uid);
+    return res.json({ message: "FCM token saved" });
+  } catch (err) {
+    console.error("[save-fcm-token]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // TRUST ENDPOINTS
 // ═══════════════════════════════════════════════════════════════
 
 app.post("/trust/update", verifyToken, async (req, res) => {
-  const { uid } = req.body;
+  const { uid }   = req.body;
   const targetUid = uid || req.user.uid;
 
   try {
@@ -656,9 +967,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     const userRef      = db.collection("users").doc(uid);
     const referralCode = await uniqueReferralCode();
 
-    // Duplicate checks run before the transaction since Firestore transactions
-    // only support t.get() on doc refs, not collection queries.
-    // The transaction then guards atomically against the profile being written twice.
     const phoneSnap = await db.collection("users").where("phone", "==", phone).limit(1).get();
     if (!phoneSnap.empty && phoneSnap.docs[0].id !== uid) {
       return res.status(409).json({ error: "That phone number is already registered" });
@@ -670,7 +978,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
-      if (snap.exists) return; // idempotent
+      if (snap.exists) return;
 
       t.set(userRef, Object.assign({
         uid,
@@ -688,9 +996,18 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         referralCode,
         referredBy:    null,
         referralCount: 0,
+        fcmToken:      null,
         createdAt:     admin.firestore.FieldValue.serverTimestamp(),
       }, DEFAULT_TRUST_FIELDS));
     });
+
+    notifyUser(
+      uid,
+      "system",
+      "Welcome to Duelix! 🎮",
+      "Your account is ready. You have been given 20 coins to start. Good luck!",
+      {}
+    ).catch(() => {});
 
     return res.status(201).json({ message: "Profile created", uid, referralCode });
   } catch (err) {
@@ -700,7 +1017,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// USER EXISTS CHECK — public
+// USER EXISTS CHECK
 // ─────────────────────────────────────────
 app.get("/user-exists/:uid", async (req, res) => {
   try {
@@ -713,10 +1030,9 @@ app.get("/user-exists/:uid", async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // REFERRAL SYSTEM
-// New user bonus: 5 coins | Referrer bonus: 5 coins
 // ═══════════════════════════════════════════════════════════════
 app.post("/apply-referral", verifyToken, async (req, res) => {
-  const currentUid = req.user.uid;
+  const currentUid      = req.user.uid;
   const { referralCode } = req.body;
 
   if (!referralCode || typeof referralCode !== "string") {
@@ -741,13 +1057,14 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "You cannot use your own referral code" });
     }
 
-    let bonusCoins = 0;
+    let bonusCoins   = 0;
+    let referrerName = "A friend";
+    let newUserName  = "A new player";
 
     await db.runTransaction(async (t) => {
       const currentRef  = db.collection("users").doc(currentUid);
       const referrerRef = db.collection("users").doc(referrerUid);
 
-      // All reads before any writes
       const [currentDoc, referrerDocT] = await Promise.all([
         t.get(currentRef),
         t.get(referrerRef),
@@ -757,7 +1074,9 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
       if (!referrerDocT.exists) throw new Error("Referrer account not found");
       if (currentDoc.data().referredBy) throw new Error("ALREADY_REFERRED");
 
-      bonusCoins = 5;
+      bonusCoins   = 5;
+      referrerName = referrerDocT.data().displayName || "A friend";
+      newUserName  = currentDoc.data().displayName   || "A new player";
 
       t.update(currentRef, {
         coins:      inc(currentDoc.data().coins, bonusCoins),
@@ -768,6 +1087,9 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
         referralCount: inc(referrerDocT.data().referralCount != null ? referrerDocT.data().referralCount : 0),
       });
     });
+
+    notifyReferralBonus(currentUid, bonusCoins, referrerName).catch(() => {});
+    notifyReferrerReward(referrerUid, 5, newUserName).catch(() => {});
 
     console.log("[apply-referral] uid=" + currentUid + " code=" + code + " newUserBonus=5 referrerBonus=5");
     return res.json({ message: "Referral applied successfully", bonusCoins });
@@ -810,7 +1132,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
       db.collection("users").doc(req.params.uid)
         .set(trustFields, { merge: true })
         .catch((e) => console.error("[user migration]", e.message));
-
       return res.json(Object.assign({}, data, trustFields));
     }
 
@@ -826,7 +1147,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
       db.collection("users").doc(req.params.uid)
         .set(patch, { merge: true })
         .catch((e) => console.error("[user patch]", e.message));
-
       return res.json(Object.assign({}, data, patch));
     }
 
@@ -900,7 +1220,7 @@ app.get("/check-username/:username", verifyToken, async (req, res) => {
 
 app.get("/coins/:uid", verifyToken, async (req, res) => {
   try {
-    const doc = await db.collection("users").doc(req.params.uid).get();
+    const doc   = await db.collection("users").doc(req.params.uid).get();
     const coins = doc.exists && doc.data().coins != null ? doc.data().coins : 0;
     return res.json({ coins });
   } catch (err) {
@@ -910,7 +1230,6 @@ app.get("/coins/:uid", verifyToken, async (req, res) => {
 
 app.post("/add-coins", verifyToken, async (req, res) => {
   const { amount } = req.body;
-  // FIX: validate amount is a positive integer — prevents float or non-integer abuse
   if (
     typeof amount !== "number" ||
     !Number.isInteger(amount) ||
@@ -933,8 +1252,7 @@ app.post("/add-coins", verifyToken, async (req, res) => {
 });
 
 app.post("/reset-account", verifyToken, async (req, res) => {
-  const { coins } = req.body;
-  // FIX: clamp coins to valid range — prevents negative or absurdly large values
+  const { coins }  = req.body;
   const resetCoins = (coins != null && Number.isInteger(coins) && coins >= 0 && coins <= 100000)
     ? coins
     : 20;
@@ -954,7 +1272,6 @@ app.post("/reset-account", verifyToken, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // DAILY REWARD
-// Day 1->1, Day 2->1, Day 3->2, Day 4->2, Day 5->3, Day 6->3, Day 7->5
 // ═══════════════════════════════════════════════════════════════
 
 function getStreakReward(streak) {
@@ -965,7 +1282,7 @@ function getStreakReward(streak) {
   if (day === 4) return 2;
   if (day === 5) return 3;
   if (day === 6) return 3;
-  return 5; // Day 7
+  return 5;
 }
 
 app.post("/claim-daily-reward", verifyToken, async (req, res) => {
@@ -1014,6 +1331,8 @@ app.post("/claim-daily-reward", verifyToken, async (req, res) => {
       rewardData = { coinsToAdd, streak };
     });
 
+    notifyDailyReward(uid, rewardData.coinsToAdd, rewardData.streak).catch(() => {});
+
     console.log("[claim-daily-reward] uid=" + uid + " coins=" + rewardData.coinsToAdd + " streak=" + rewardData.streak);
     return res.json({
       message:    "Daily reward claimed",
@@ -1033,7 +1352,6 @@ app.post("/matches/create", verifyToken, async (req, res) => {
   const { game, entryFee } = req.body;
   const uid = req.user.uid;
 
-  // FIX: validate game is a non-empty non-whitespace string
   if (!game || typeof game !== "string" || !game.trim()) {
     return res.status(400).json({ error: "game is required" });
   }
@@ -1083,6 +1401,8 @@ app.post("/matches/create", verifyToken, async (req, res) => {
       });
     });
 
+    notifyMatchCreated(uid, matchId, gameUpper, entryFee).catch(() => {});
+
     return res.status(201).json({
       matchId,
       status:       "waiting",
@@ -1127,7 +1447,6 @@ app.post("/matches/join", verifyToken, async (req, res) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
 
-      // All reads before writes
       const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
@@ -1151,7 +1470,6 @@ app.post("/matches/join", verifyToken, async (req, res) => {
         matchStartedAt: now,
       });
 
-      // FIX: use matchId variable directly instead of match.id which could be undefined
       joinedMatch = {
         matchId:      matchId,
         playerA:      match.playerA,
@@ -1163,6 +1481,8 @@ app.post("/matches/join", verifyToken, async (req, res) => {
         loserReward:  loserReward(match.entryFee),
       };
     });
+
+    notifyMatchJoined(joinedMatch.playerA, uid, matchId, joinedMatch.game).catch(() => {});
 
     return res.json({ message: "Joined match successfully", match: joinedMatch });
   } catch (err) {
@@ -1176,11 +1496,11 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
   if (!matchId) return res.status(400).json({ error: "matchId required" });
 
   try {
+    let entryFeeRefunded = 0;
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
 
-      // All reads before writes
       const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
@@ -1191,12 +1511,17 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
       if (match.playerB != null)      throw new Error("Cannot cancel -- opponent has already joined");
       if (match.status !== "waiting") throw new Error("Match cannot be cancelled at this stage");
 
+      entryFeeRefunded = match.entryFee;
+
       t.update(userRef,  { coins: inc(userDoc.data().coins, match.entryFee) });
       t.update(matchRef, {
         status:      "cancelled",
         cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
+
+    notifyMatchCancelled(uid, matchId, entryFeeRefunded).catch(() => {});
+
     return res.json({ message: "Match cancelled -- match ticket refunded" });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1210,7 +1535,6 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
   const { game, entryFee } = req.body;
   const uid = req.user.uid;
 
-  // FIX: validate game is a non-empty non-whitespace string
   if (!game || typeof game !== "string" || !game.trim()) {
     return res.status(400).json({ error: "game is required" });
   }
@@ -1220,8 +1544,9 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
   const gameUpper = game.trim().toUpperCase();
 
   try {
-    let matchId   = null;
-    let didCreate = false;
+    let matchId    = null;
+    let didCreate  = false;
+    let playerAUid = null;
 
     const candidateSnap = await db
       .collection("matches")
@@ -1246,7 +1571,6 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
         const matchRef = db.collection("matches").doc(matchId);
         const userRef  = db.collection("users").doc(uid);
 
-        // All reads before writes
         const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
 
         if (!matchDoc.exists) throw new Error("Match no longer exists");
@@ -1261,6 +1585,8 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
         if (match.isPrivate === true)      throw new Error("Cannot join a private match");
         if (coins < match.entryFee)        throw new Error("Insufficient coins");
 
+        playerAUid = match.playerA;
+
         const now = admin.firestore.FieldValue.serverTimestamp();
         t.update(userRef,  { coins: coins - match.entryFee });
         t.update(matchRef, {
@@ -1271,10 +1597,15 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
           matchStartedAt: now,
         });
       });
+
+      if (playerAUid) {
+        notifyMatchJoined(playerAUid, uid, matchId, gameUpper).catch(() => {});
+      }
       console.log("[quick-match] JOINED " + matchId + " uid=" + uid);
 
     } else {
-      didCreate = true;
+      didCreate  = true;
+      playerAUid = uid;
       await db.runTransaction(async (t) => {
         const userRef  = db.collection("users").doc(uid);
         const matchRef = db.collection("matches").doc();
@@ -1313,6 +1644,8 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
           cancelReason:       null,
         });
       });
+
+      notifyMatchCreated(uid, matchId, gameUpper, entryFee).catch(() => {});
       console.log("[quick-match] CREATED " + matchId + " uid=" + uid);
     }
 
@@ -1336,7 +1669,6 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
   if (!matchId || myScore === undefined || opponentScore === undefined) {
     return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
   }
-  // FIX: scores must be non-negative integers — prevents -1 or 1.5 as valid scores
   try {
     validateScore(myScore,       "myScore");
     validateScore(opponentScore, "opponentScore");
@@ -1345,6 +1677,7 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
   }
 
   try {
+    let opponentUid = null;
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -1355,7 +1688,7 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
       if (match.status !== "active") throw new Error("Match is not active");
       if (hasSubmittedResult(match)) throw new Error("Result already submitted");
 
-      const opponentUid = uid === match.playerA ? match.playerB : match.playerA;
+      opponentUid = uid === match.playerA ? match.playerB : match.playerA;
       t.update(matchRef, {
         result: {
           myScore,
@@ -1366,6 +1699,11 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
         submittedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
+
+    if (opponentUid) {
+      notifyResultSubmitted(opponentUid, matchId).catch(() => {});
+    }
+
     return res.json({ message: "Result submitted -- waiting for opponent to confirm" });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1378,13 +1716,15 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
   if (!matchId) return res.status(400).json({ error: "matchId required" });
 
   try {
-    let result = {};
+    let result        = {};
+    let matchSnapshot = null;
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
       if (!matchDoc.exists) throw new Error("Match not found");
 
       const match = matchDoc.data();
+      matchSnapshot = match;
       if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
       if (match.status === "completed") throw new Error("Match already completed");
       if (match.status !== "active")    throw new Error("Match is not active");
@@ -1404,6 +1744,23 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       result = await distributeReward(t, match, matchRef, confirmedWinner);
     });
+
+    if (matchSnapshot) {
+      const w  = result.confirmedWinner;
+      const wR = result.winner;
+      const lR = result.loser;
+      const ef = matchSnapshot.entryFee;
+
+      if (w === "draw") {
+        notifyMatchDraw(matchSnapshot.playerA, matchId, ef).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerB, matchId, ef).catch(() => {});
+      } else {
+        const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
+        notifyMatchWon(w,         matchId, wR).catch(() => {});
+        notifyMatchLost(loserUid, matchId, lR).catch(() => {});
+      }
+    }
+
     return res.json({ message: "Result confirmed", confirmedWinner: result.confirmedWinner });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1412,10 +1769,6 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
 // ═══════════════════════════════════════════════════════════════
 // DISPUTE
-//
-// FIX: uses a Firestore transaction instead of a batch to make the
-// status check and the write atomic, preventing a race where two
-// concurrent dispute requests both pass the status check.
 // ═══════════════════════════════════════════════════════════════
 app.post("/matches/dispute", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1442,7 +1795,8 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
   }
 
   try {
-    let disputeId = null;
+    let disputeId   = null;
+    let opponentUid = null;
 
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
@@ -1455,9 +1809,10 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       if (match.status === "completed") throw new Error("ALREADY_COMPLETED");
       if (match.status === "cancelled") throw new Error("ALREADY_CANCELLED");
 
+      opponentUid = match.playerA === uid ? match.playerB : match.playerA;
+
       const disputeRef = db.collection("disputes").doc();
       disputeId = disputeRef.id;
-
       const now = admin.firestore.FieldValue.serverTimestamp();
 
       t.set(disputeRef, {
@@ -1490,6 +1845,11 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
         disputeId:  disputeId,
       });
     });
+
+    notifyDisputeOpened(uid, matchId).catch(() => {});
+    if (opponentUid) {
+      notifyDisputeOpened(opponentUid, matchId).catch(() => {});
+    }
 
     console.log("[dispute] matchId=" + matchId + " reason=\"" + validatedReason + "\" uid=" + uid);
     return res.json({ message: "Dispute submitted -- under review", disputeId });
@@ -1527,18 +1887,15 @@ app.get("/matches/history", verifyToken, async (req, res) => {
 
 // ─────────────────────────────────────────
 // AUTO-RESOLVE
-//
-// The non-submitter (rage quit) receives a trust penalty via
-// applyTrustUpdate. They do NOT receive the clean match reward.
-// distributeRewardAutoResolve scopes the clean reward only to the
-// submitter.
 // ─────────────────────────────────────────
 app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   if (!matchId) return res.status(400).json({ error: "matchId required" });
 
   try {
-    let result = {};
+    let result        = {};
+    let matchSnapshot = null;
+
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -1560,6 +1917,8 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
         throw new Error("No result submitted -- use auto-cancel");
       }
 
+      matchSnapshot = match;
+
       const scoreOf        = match.result && match.result.scoreOf ? match.result.scoreOf : {};
       const submitter      = match.submittedBy;
       const other          = submitter === match.playerA ? match.playerB : match.playerA;
@@ -1571,7 +1930,6 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       else if (otherScore > submitterScore) confirmedWinner = other;
       else                                  confirmedWinner = "draw";
 
-      // Non-submitter rage quit — penalty only, no clean match reward
       const nonSubmitterRef = db.collection("users").doc(other);
       const nonSubmitterDoc = await t.get(nonSubmitterRef);
       if (nonSubmitterDoc.exists) {
@@ -1585,6 +1943,25 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       result = await distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, other);
       t.update(matchRef, { autoResolved: true });
     });
+
+    if (matchSnapshot && !result.alreadyResolved && !result.alreadyCancelled) {
+      const w  = result.confirmedWinner;
+      const wR = result.winner;
+      const lR = result.loser;
+      const ef = matchSnapshot.entryFee;
+
+      notifyAutoResolved(matchSnapshot.playerA, matchId, w).catch(() => {});
+      notifyAutoResolved(matchSnapshot.playerB, matchId, w).catch(() => {});
+
+      if (w === "draw") {
+        notifyMatchDraw(matchSnapshot.playerA, matchId, ef).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerB, matchId, ef).catch(() => {});
+      } else {
+        const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
+        notifyMatchWon(w,         matchId, wR).catch(() => {});
+        notifyMatchLost(loserUid, matchId, lR).catch(() => {});
+      }
+    }
 
     if (result.alreadyResolved) {
       return res.json({ message: "Already resolved", confirmedWinner: result.confirmedWinner });
@@ -1603,7 +1980,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
   if (!matchId) return res.status(400).json({ error: "matchId required" });
 
   try {
-    let alreadyDone = false;
+    let alreadyDone   = false;
+    let matchSnapshot = null;
+
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -1621,10 +2000,11 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
         throw new Error("Result submitted -- use auto-resolve");
       }
 
+      matchSnapshot = match;
+
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
 
-      // All reads before writes
       const [playerA_Doc, playerB_Doc] = await Promise.all([
         t.get(playerA_Ref),
         t.get(playerB_Ref),
@@ -1636,11 +2016,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const playerA_Data = playerA_Doc.data();
       const playerB_Data = playerB_Doc.data();
 
-      // Refund both players
       t.update(playerA_Ref, { coins: inc(playerA_Data.coins, match.entryFee) });
       t.update(playerB_Ref, { coins: inc(playerB_Data.coins, match.entryFee) });
 
-      // Both abandoned — rage quit penalty for both, no clean match reward
       const aUpdated = Object.assign({}, playerA_Data, { rageQuits: inc(playerA_Data.rageQuits) });
       const bUpdated = Object.assign({}, playerB_Data, { rageQuits: inc(playerB_Data.rageQuits) });
       t.update(playerA_Ref, { rageQuits: inc(playerA_Data.rageQuits) });
@@ -1656,6 +2034,11 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       });
     });
 
+    if (!alreadyDone && matchSnapshot) {
+      notifyAutoCancelled(matchSnapshot.playerA, matchId, matchSnapshot.entryFee).catch(() => {});
+      notifyAutoCancelled(matchSnapshot.playerB, matchId, matchSnapshot.entryFee).catch(() => {});
+    }
+
     if (alreadyDone) return res.json({ message: "No action needed" });
     return res.json({ message: "Auto-cancelled -- both players refunded" });
   } catch (err) {
@@ -1669,11 +2052,11 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
   if (!matchId) return res.status(400).json({ error: "matchId required" });
 
   try {
+    let opponentUid = null;
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
 
-      // All reads before writes
       const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
       if (!matchDoc.exists) throw new Error("Match not found");
       if (!userDoc.exists)  throw new Error("User not found");
@@ -1685,12 +2068,19 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
       const userCoins = userDoc.data().coins != null ? userDoc.data().coins : 0;
       if (userCoins < match.entryFee)    throw new Error("Insufficient coins for rematch");
 
+      opponentUid = match.playerA === uid ? match.playerB : match.playerA;
+
       t.update(matchRef, {
         rematchRequestedBy: uid,
         rematchStatus:      "pending",
         rematchRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
+
+    if (opponentUid) {
+      notifyRematchRequested(opponentUid, matchId).catch(() => {});
+    }
+
     return res.json({ message: "Rematch requested" });
   } catch (err) {
     return res.status(400).json({ error: err.message });
@@ -1706,10 +2096,20 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
 
   if (!accept) {
     try {
+      const matchDoc = await db.collection("matches").doc(matchId).get();
+      const rematchRequester = matchDoc.exists && matchDoc.data().rematchRequestedBy
+        ? matchDoc.data().rematchRequestedBy
+        : null;
+
       await db.collection("matches").doc(matchId).update({
         rematchStatus:     "declined",
         rematchDeclinedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
+
+      if (rematchRequester) {
+        notifyRematchDeclined(rematchRequester, matchId).catch(() => {});
+      }
+
       return res.json({ message: "Rematch declined" });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -1717,6 +2117,9 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
   }
 
   try {
+    let playerAUid = null;
+    let playerBUid = null;
+
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -1727,10 +2130,12 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
       if (match.rematchStatus !== "pending")  throw new Error("No pending rematch");
       if (match.rematchRequestedBy === uid)   throw new Error("Cannot accept own rematch request");
 
+      playerAUid = match.playerA;
+      playerBUid = match.playerB;
+
       const playerA_Ref = db.collection("users").doc(match.playerA);
       const playerB_Ref = db.collection("users").doc(match.playerB);
 
-      // All reads before writes
       const [playerA_Doc, playerB_Doc] = await Promise.all([
         t.get(playerA_Ref),
         t.get(playerB_Ref),
@@ -1769,9 +2174,109 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         players:            [match.playerA, match.playerB],
       });
     });
+
+    if (playerAUid) notifyRematchAccepted(playerAUid, matchId).catch(() => {});
+    if (playerBUid) notifyRematchAccepted(playerBUid, matchId).catch(() => {});
+
     return res.json({ message: "Rematch accepted -- match restarted" });
   } catch (err) {
     return res.status(400).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// MATCH ROOM CHAT
+// ═══════════════════════════════════════════════════════════════
+
+app.post("/matches/chat/send", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { matchId, message } = req.body;
+
+  if (!matchId || typeof matchId !== "string" || !matchId.trim()) {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+  if (!message || typeof message !== "string" || !message.trim()) {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  const safeText = message.trim().substring(0, 300);
+
+  try {
+    const matchDoc = await db.collection("matches").doc(matchId).get();
+    if (!matchDoc.exists) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+
+    const match = matchDoc.data();
+    if (match.playerA !== uid && match.playerB !== uid) {
+      return res.status(403).json({ error: "You are not in this match" });
+    }
+
+    const recipientUid = match.playerA === uid ? match.playerB : match.playerA;
+
+    const senderDoc  = await db.collection("users").doc(uid).get();
+    const senderName = senderDoc.exists && senderDoc.data().displayName
+      ? senderDoc.data().displayName
+      : "Opponent";
+
+    const chatRef = db
+      .collection("matches")
+      .doc(matchId)
+      .collection("chat")
+      .doc();
+
+    await chatRef.set({
+      id:        chatRef.id,
+      matchId,
+      senderId:  uid,
+      senderName,
+      message:   safeText,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (recipientUid) {
+      notifyChatMessage(recipientUid, senderName, matchId, safeText).catch(() => {});
+    }
+
+    return res.status(201).json({ message: "Message sent", messageId: chatRef.id });
+  } catch (err) {
+    console.error("[chat/send]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+app.get("/matches/chat/:matchId", verifyToken, async (req, res) => {
+  const uid     = req.user.uid;
+  const matchId = req.params.matchId;
+
+  if (!matchId || typeof matchId !== "string") {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+
+  try {
+    const matchDoc = await db.collection("matches").doc(matchId).get();
+    if (!matchDoc.exists) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+
+    const match = matchDoc.data();
+    if (match.playerA !== uid && match.playerB !== uid) {
+      return res.status(403).json({ error: "You are not in this match" });
+    }
+
+    const chatSnap = await db
+      .collection("matches")
+      .doc(matchId)
+      .collection("chat")
+      .orderBy("createdAt", "asc")
+      .limit(50)
+      .get();
+
+    const messages = chatSnap.docs.map((d) => d.data());
+    return res.json(messages);
+  } catch (err) {
+    console.error("[chat/get]", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 
@@ -1831,7 +2336,6 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
       const d = doc.data();
       return {
         rank:         i + 1,
-        // FIX: fallback for uid field in case old profiles were written without it
         uid:          d.uid          != null ? d.uid          : doc.id,
         displayName:  d.displayName  != null ? d.displayName  : "Player",
         wins:         d.wins         != null ? d.wins         : 0,
@@ -1849,13 +2353,6 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
 
 // ─────────────────────────────────────────
 // ADMIN — TRUST MIGRATION
-//
-// Recalculates trustScore, fairPlayRating, and matchCompletionRate
-// for every user using the updated formula (base 80).
-// Safe to re-run: idempotent, uses current stored stats each time.
-// Processes users in batches of 100 to avoid Firestore timeouts.
-// Security: requires verifyToken. Call from your admin account only.
-// Returns { migrated, skipped, errors } counts.
 // ─────────────────────────────────────────
 app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
   let migrated = 0;
@@ -1882,18 +2379,12 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       snap.docs.forEach((doc) => {
         try {
           const data = doc.data();
-
-          const trustScore          = computeTrustScore(data);
-          const fairPlayRating      = computeFairPlayRating(data);
-          const matchCompletionRate = computeCompletionRate(data);
-
           batch.set(doc.ref, {
-            trustScore,
-            fairPlayRating,
-            matchCompletionRate,
-            trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+            trustScore:          computeTrustScore(data),
+            fairPlayRating:      computeFairPlayRating(data),
+            matchCompletionRate: computeCompletionRate(data),
+            trustUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
           }, { merge: true });
-
           migrated++;
         } catch (e) {
           console.error("[migrate-trust] error on uid=" + doc.id + ":", e.message);
@@ -1902,7 +2393,6 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       });
 
       await batch.commit();
-
       lastDoc = snap.docs[snap.docs.length - 1];
       hasMore = snap.docs.length === 100;
     }
@@ -1912,6 +2402,140 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("[migrate-trust] fatal:", err.message);
     return res.status(500).json({ error: err.message, migrated, skipped, errors });
+  }
+});
+
+// ─────────────────────────────────────────
+// ROOM TIMER NOTIFICATIONS
+// ─────────────────────────────────────────
+app.post("/matches/timer-alert", verifyToken, async (req, res) => {
+  const { matchId, alertType } = req.body;
+
+  if (!matchId || typeof matchId !== "string") {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+  const validAlerts = ["5min", "1min", "expired"];
+  if (!alertType || !validAlerts.includes(alertType)) {
+    return res.status(400).json({ error: "alertType must be 5min, 1min, or expired" });
+  }
+
+  try {
+    const matchDoc = await db.collection("matches").doc(matchId).get();
+    if (!matchDoc.exists) {
+      return res.status(404).json({ error: "Match not found" });
+    }
+
+    const match = matchDoc.data();
+    if (match.status !== "active") {
+      return res.json({ message: "Match not active -- no alert sent" });
+    }
+
+    const uids = [match.playerA, match.playerB].filter(Boolean);
+
+    await Promise.all(
+      uids.map((uid) => notifyRoomTimer(uid, matchId, alertType).catch(() => {}))
+    );
+
+    return res.json({ message: "Timer alert sent", alertType, matchId });
+  } catch (err) {
+    console.error("[timer-alert]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// NOTIFICATION TRIGGER ENDPOINT
+// ═══════════════════════════════════════════════════════════════
+app.post("/notifications/trigger", verifyToken, async (req, res) => {
+  const { userId, type, title, message, meta } = req.body;
+
+  if (!userId || typeof userId !== "string" || !userId.trim()) {
+    return res.status(400).json({ error: "userId is required" });
+  }
+  if (!type || typeof type !== "string" || !type.trim()) {
+    return res.status(400).json({ error: "type is required" });
+  }
+  if (!title || typeof title !== "string" || !title.trim()) {
+    return res.status(400).json({ error: "title is required" });
+  }
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message is required" });
+  }
+
+  const safeMeta      = (meta && typeof meta === "object" && !Array.isArray(meta)) ? meta : {};
+  const pushOnlyTypes = ["chat_message", "room_timer"];
+  const isPushOnly    = pushOnlyTypes.includes(type.trim());
+
+  try {
+    if (!isPushOnly) {
+      await createNotification(userId, type, title, message, safeMeta);
+    }
+
+    const userDoc = await db.collection("users").doc(userId).get();
+    if (userDoc.exists) {
+      const userData = userDoc.data();
+      if (userData.notificationsEnabled === true && userData.fcmToken) {
+        const pushData = Object.assign({}, safeMeta, { type });
+        await sendPushNotification(userId, title, message, pushData);
+      }
+    }
+
+    return res.json({ message: "Notification triggered", pushOnly: isPushOnly });
+  } catch (err) {
+    console.error("[notifications/trigger]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// UPDATE NOTIFICATION PREFERENCES
+// ─────────────────────────────────────────
+app.post("/update-notification-prefs", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { notificationPromptShown, notificationsEnabled } = req.body;
+
+  if (
+    typeof notificationPromptShown !== "boolean" ||
+    typeof notificationsEnabled    !== "boolean"
+  ) {
+    return res.status(400).json({ error: "Both fields must be boolean" });
+  }
+
+  try {
+    const update = {
+      notificationPromptShown,
+      notificationsEnabled,
+      notificationPrefsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    };
+
+    if (!notificationsEnabled) {
+      update.fcmToken = admin.firestore.FieldValue.delete();
+    }
+
+    await db.collection("users").doc(uid).update(update);
+    console.log("[update-notification-prefs] uid=" + uid + " enabled=" + notificationsEnabled);
+    return res.json({ message: "Notification preferences saved" });
+  } catch (err) {
+    console.error("[update-notification-prefs]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────
+// DELETE FCM TOKEN
+// ─────────────────────────────────────────
+app.delete("/save-fcm-token", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  try {
+    await db.collection("users").doc(uid).update({
+      fcmToken:          admin.firestore.FieldValue.delete(),
+      fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    console.log("[delete-fcm-token] uid=" + uid);
+    return res.json({ message: "FCM token removed" });
+  } catch (err) {
+    console.error("[delete-fcm-token]", err.message);
+    return res.status(500).json({ error: err.message });
   }
 });
 

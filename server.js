@@ -81,13 +81,29 @@ async function uniqueReferralCode() {
 }
 
 // =============================================================
-// MATCH REWARD DISTRIBUTION — 80 / 10 / 10
+// NEW MATCH ECONOMY
+// Pool = entryFee * 2
+// Winner = 65% of pool
+// Loser  = 5%  of pool
+// Platform = 15% of pool (remaining after winner + loser)
+//
+// Examples (entry=50):
+//   pool=100, winner=65, loser=5, platform=15+15=30 (but we keep it simple below)
+//
+// Exact formula per spec:
+//   winner = entryFee * 1.30  (130% of one side = 65% of pool)
+//   loser  = entryFee * 0.10  (10%  of one side = 5%  of pool)
+//   platform = pool - winner - loser
 // =============================================================
 const pool         = (entryFee) => entryFee * 2;
-const winnerReward = (entryFee) => Math.floor(pool(entryFee) * 0.80);
-const loserReward  = (entryFee) => Math.floor(pool(entryFee) * 0.10);
+const winnerReward = (entryFee) => Math.floor(entryFee * 1.30);
+const loserReward  = (entryFee) => Math.floor(entryFee * 0.10);
 const platformFee  = (entryFee) =>
   pool(entryFee) - winnerReward(entryFee) - loserReward(entryFee);
+
+// Draw: both players refunded 90% of entry fee. Platform keeps 10%.
+const drawRefund      = (entryFee) => Math.floor(entryFee * 0.90);
+const drawPlatformFee = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
 
 function validateEntryFee(entryFee) {
   if (
@@ -111,6 +127,9 @@ function hasSubmittedResult(match) {
 
 // =============================================================
 // COIN PACKAGE CATALOGUE
+// $0.50 → 50  | $1.00 → 105 | $2.00 → 215
+// $5.00 → 550 | $10.00 → 1150 | $20.00 → 2400
+// Amounts in pesewas (GHS smallest unit, like kobo for NGN)
 // =============================================================
 const COIN_PACKAGES = {
   "coins_50": {
@@ -303,10 +322,6 @@ function validateDisputeNote(note) {
 // ANTI-FRAUD / ANTI-FARMING HELPERS
 // =============================================================
 
-/**
- * Records a device fingerprint + IP for a new user registration.
- * Used to detect multi-account farming from the same device or IP.
- */
 async function recordDeviceFingerprint(uid, deviceId, installId, ipAddress) {
   if (!uid) return;
   try {
@@ -323,10 +338,6 @@ async function recordDeviceFingerprint(uid, deviceId, installId, ipAddress) {
   }
 }
 
-/**
- * Returns the number of existing accounts sharing the same deviceId or installId.
- * Used to block signup bonus + referral farming from the same device.
- */
 async function countAccountsByDevice(deviceId, installId) {
   if (!deviceId && !installId) return 0;
   try {
@@ -357,14 +368,11 @@ async function countAccountsByDevice(deviceId, installId) {
   }
 }
 
-/**
- * Returns whether an IP has registered too many accounts recently (last 24h).
- */
 async function isIpAbusive(ipAddress) {
   if (!ipAddress) return false;
   try {
-    const cutoff    = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const snap      = await db.collection("device_fingerprints")
+    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const snap   = await db.collection("device_fingerprints")
       .where("ipAddress", "==", ipAddress)
       .orderBy("recordedAt", "desc")
       .limit(10)
@@ -373,17 +381,30 @@ async function isIpAbusive(ipAddress) {
       const ts = doc.data().recordedAt;
       return ts && ts.toDate && ts.toDate() > cutoff;
     });
-    return recent.length >= 5; // block if 5+ accounts from same IP in 24h
+    return recent.length >= 5;
   } catch (err) {
     console.error("[isIpAbusive]", err.message);
     return false;
   }
 }
 
-/**
- * Checks whether this user has already received their first-purchase referral reward.
- * Referral rewards activate only once — after the first successful coin purchase.
- */
+async function detectSuspiciousActivity(uid, context) {
+  try {
+    await db.collection("security_logs").doc().set({
+      uid,
+      context,
+      flaggedAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    await db.collection("users").doc(uid).set(
+      { suspiciousFlag: true, suspiciousFlagReason: context },
+      { merge: true }
+    );
+    console.warn("[security] Suspicious activity flagged uid=" + uid + " context=" + context);
+  } catch (err) {
+    console.error("[detectSuspiciousActivity]", err.message);
+  }
+}
+
 async function tryGrantReferralReward(uid) {
   try {
     const userDoc = await db.collection("users").doc(uid).get();
@@ -391,11 +412,22 @@ async function tryGrantReferralReward(uid) {
 
     const user = userDoc.data();
 
-    // Only activate if the user was referred AND reward hasn't been granted yet
-    if (!user.referredBy)              return;
-    if (user.referralRewardGranted)    return;
+    if (!user.referredBy)           return;
+    if (user.referralRewardGranted) return;
 
     const referrerUid = user.referredBy;
+
+    // Anti-farming: warn if referrer and referee share device
+    const deviceSnap = await db.collection("device_fingerprints")
+      .where("uid", "==", referrerUid).limit(3).get();
+    const referrerDevices = new Set(deviceSnap.docs.map((d) => d.data().deviceId).filter(Boolean));
+    const userDeviceSnap  = await db.collection("device_fingerprints")
+      .where("uid", "==", uid).limit(3).get();
+    userDeviceSnap.docs.forEach((d) => {
+      if (d.data().deviceId && referrerDevices.has(d.data().deviceId)) {
+        detectSuspiciousActivity(uid, "referral_same_device referrer=" + referrerUid).catch(() => {});
+      }
+    });
 
     await db.runTransaction(async (t) => {
       const userRef     = db.collection("users").doc(uid);
@@ -406,14 +438,13 @@ async function tryGrantReferralReward(uid) {
         t.get(referrerRef),
       ]);
 
-      if (!freshUser.exists)  throw new Error("User not found");
+      if (!freshUser.exists)   throw new Error("User not found");
       if (!referrerDoc.exists) throw new Error("Referrer not found");
 
-      // Double-check guard inside transaction
       if (freshUser.data().referralRewardGranted) return;
 
       t.update(userRef, {
-        coins:                inc(freshUser.data().coins, 5),
+        coins:                 inc(freshUser.data().coins, 5),
         referralRewardGranted: true,
       });
       t.update(referrerRef, {
@@ -421,7 +452,6 @@ async function tryGrantReferralReward(uid) {
       });
     });
 
-    // Fire notifications outside the transaction
     notifyReferralBonus(uid, 5, userDoc.data().referredByName || "A friend").catch(() => {});
     notifyReferrerReward(referrerUid, 5, user.displayName || "A new player").catch(() => {});
 
@@ -432,7 +462,72 @@ async function tryGrantReferralReward(uid) {
 }
 
 // =============================================================
-// PAYSTACK VERIFICATION HELPER
+// PAYSTACK — INITIALIZE TRANSACTION (browser authorization flow)
+// Returns { authorization_url, reference } to Flutter.
+// Flutter opens authorization_url in a WebView/browser.
+// After payment, Flutter calls /store/verify-purchase with reference.
+// =============================================================
+function initializePaystackTransaction(email, amountInPesewas, currency, reference, metadata) {
+  return new Promise((resolve, reject) => {
+    if (!PAYSTACK_SECRET_KEY) {
+      return reject(new Error("PAYSTACK_SECRET_KEY is not configured on the server."));
+    }
+
+    const body = JSON.stringify({
+      email,
+      amount:    amountInPesewas,
+      currency,
+      reference,
+      metadata: metadata || {},
+      callback_url: "https://duelix-app.web.app/payment-callback",
+    });
+
+    const options = {
+      hostname: "api.paystack.co",
+      port:     443,
+      path:     "/transaction/initialize",
+      method:   "POST",
+      headers: {
+        "Authorization": "Bearer " + PAYSTACK_SECRET_KEY,
+        "Content-Type":  "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(data);
+          if (!parsed.status) {
+            return reject(new Error(
+              "Paystack init failed: " + (parsed.message || "unknown error")
+            ));
+          }
+          resolve(parsed.data);
+        } catch (e) {
+          reject(new Error("Failed to parse Paystack init response: " + e.message));
+        }
+      });
+    });
+
+    req.on("error", (e) => {
+      reject(new Error("Paystack network error: " + e.message));
+    });
+
+    req.setTimeout(15000, () => {
+      req.destroy();
+      reject(new Error("Paystack initialization timed out."));
+    });
+
+    req.write(body);
+    req.end();
+  });
+}
+
+// =============================================================
+// PAYSTACK — VERIFY TRANSACTION
 // =============================================================
 function verifyPaystackTransaction(reference) {
   return new Promise((resolve, reject) => {
@@ -669,7 +764,7 @@ function notifyMatchLost(userId, matchId, coinsBack) {
 function notifyMatchDraw(userId, matchId, coinsBack) {
   return notifyUser(
     userId, "match_draw", "It's a draw!",
-    "Match ended in a draw. Your entry fee of " + coinsBack + " coins has been refunded.",
+    "Match ended in a draw. " + coinsBack + " coins have been refunded.",
     { matchId, coinsBack }
   );
 }
@@ -795,14 +890,26 @@ function notifyRoomTimer(userId, matchId, alertType) {
 
 // =============================================================
 // REWARD DISTRIBUTION — CONFIRM-RESULT PATH
+//
+// New economy:
+//   winner = 130% of entry fee (entryFee * 1.30, floored)
+//   loser  = 10%  of entry fee (entryFee * 0.10, floored)
+//   platform = remainder
+//
+// Draw: both refunded 90% of entry fee. No RC for draws.
+//
 // RC = 30% of entry fee (floored). Winners only.
-// First-bonus-match guard: users whose bonusMatchUsed is false
-// do not receive RC for that match, then the flag is set to true.
+// RC NOT granted if bonusMatchUsed === false (first free match).
+// bonusMatchUsed set to true after first match for both players.
+//
+// Signup bonus coins NEVER generate RC (bonusMatchUsed guard).
 // =============================================================
 async function distributeReward(t, match, matchRef, confirmedWinner) {
   const winner = winnerReward(match.entryFee);
   const loser  = loserReward(match.entryFee);
   const plat   = platformFee(match.entryFee);
+  const dRefund = drawRefund(match.entryFee);
+  const dPlat   = drawPlatformFee(match.entryFee);
 
   const playerA_Ref = db.collection("users").doc(match.playerA);
   const playerB_Ref = db.collection("users").doc(match.playerB);
@@ -822,6 +929,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
+    // Draw: refund 90% each, no RC
     const aUpdated = Object.assign({}, playerA_Data, {
       completedMatches: inc(playerA_Data.completedMatches),
       totalMatches:     inc(playerA_Data.totalMatches),
@@ -832,13 +940,13 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     });
 
     t.update(playerA_Ref, {
-      coins:            inc(playerA_Data.coins, match.entryFee),
+      coins:            inc(playerA_Data.coins, dRefund),
       draws:            inc(playerA_Data.draws),
       totalMatches:     inc(playerA_Data.totalMatches),
       completedMatches: inc(playerA_Data.completedMatches),
     });
     t.update(playerB_Ref, {
-      coins:            inc(playerB_Data.coins, match.entryFee),
+      coins:            inc(playerB_Data.coins, dRefund),
       draws:            inc(playerB_Data.draws),
       totalMatches:     inc(playerB_Data.totalMatches),
       completedMatches: inc(playerB_Data.completedMatches),
@@ -846,6 +954,17 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
     applyCleanMatchReward(t, playerA_Ref, aUpdated);
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
+
+    // Mark bonusMatchUsed for both
+    if (!playerA_Data.bonusMatchUsed) t.update(playerA_Ref, { bonusMatchUsed: true });
+    if (!playerB_Data.bonusMatchUsed) t.update(playerB_Ref, { bonusMatchUsed: true });
+
+    const platformCoins = platformDoc.exists
+      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
+    t.set(platformRef, {
+      totalCoins:  inc(platformCoins, dPlat),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
@@ -878,8 +997,9 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    // RC = 30% of entry fee. Skipped if this is the winner's first bonus-based match.
-    const rcEarned = Math.floor(match.entryFee * 0.30);
+    // RC = 30% of entry fee. Only for winner. Only if bonusMatchUsed === true.
+    // Signup bonus coins = bonusMatchUsed is false → no RC that match.
+    const rcEarned       = Math.floor(match.entryFee * 0.30);
     const bonusMatchUsed = winnerData.bonusMatchUsed === true;
 
     if (rcEarned > 0 && bonusMatchUsed) {
@@ -887,18 +1007,15 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       t.update(winnerRef, { rcBalance: currentRc + rcEarned });
     }
 
-    // Mark the bonus match as used after their first match (whether they won or lost)
-    if (!bonusMatchUsed) {
-      t.update(winnerRef, { bonusMatchUsed: true });
-      t.update(loserRef,  { bonusMatchUsed: true });
-    }
+    // Mark bonusMatchUsed after first match for both players
+    if (!winnerData.bonusMatchUsed) t.update(winnerRef, { bonusMatchUsed: true });
+    if (!loserData.bonusMatchUsed)  t.update(loserRef,  { bonusMatchUsed: true });
 
     applyCleanMatchReward(t, winnerRef, winnerUpdated);
     applyCleanMatchReward(t, loserRef,  loserUpdated);
 
     const platformCoins = platformDoc.exists
-      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0)
-      : 0;
+      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, {
       totalCoins:  inc(platformCoins, plat),
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
@@ -911,7 +1028,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     rewarded:           true,
     winnerReward:       confirmedWinner === "draw" ? 0 : winner,
     loserReward:        confirmedWinner === "draw" ? 0 : loser,
-    platformFee:        confirmedWinner === "draw" ? 0 : plat,
+    platformFee:        confirmedWinner === "draw" ? dPlat : plat,
     confirmedAt:        admin.firestore.FieldValue.serverTimestamp(),
     rematchRequestedBy: null,
     rematchStatus:      null,
@@ -923,12 +1040,15 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION — AUTO-RESOLVE PATH
-// RC = 30% of entry fee. Not granted to the non-submitter.
+// Same economy as confirm path.
+// RC NOT granted to non-submitter (rage quitter).
 // =============================================================
 async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, nonSubmitterUid) {
-  const winner = winnerReward(match.entryFee);
-  const loser  = loserReward(match.entryFee);
-  const plat   = platformFee(match.entryFee);
+  const winner  = winnerReward(match.entryFee);
+  const loser   = loserReward(match.entryFee);
+  const plat    = platformFee(match.entryFee);
+  const dRefund = drawRefund(match.entryFee);
+  const dPlat   = drawPlatformFee(match.entryFee);
 
   const playerA_Ref = db.collection("users").doc(match.playerA);
   const playerB_Ref = db.collection("users").doc(match.playerB);
@@ -958,13 +1078,13 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     });
 
     t.update(playerA_Ref, {
-      coins:            inc(playerA_Data.coins, match.entryFee),
+      coins:            inc(playerA_Data.coins, dRefund),
       draws:            inc(playerA_Data.draws),
       totalMatches:     inc(playerA_Data.totalMatches),
       completedMatches: inc(playerA_Data.completedMatches),
     });
     t.update(playerB_Ref, {
-      coins:            inc(playerB_Data.coins, match.entryFee),
+      coins:            inc(playerB_Data.coins, dRefund),
       draws:            inc(playerB_Data.draws),
       totalMatches:     inc(playerB_Data.totalMatches),
       completedMatches: inc(playerB_Data.completedMatches),
@@ -972,6 +1092,16 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
 
     applyCleanMatchReward(t, playerA_Ref, aUpdated);
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
+
+    if (!playerA_Data.bonusMatchUsed) t.update(playerA_Ref, { bonusMatchUsed: true });
+    if (!playerB_Data.bonusMatchUsed) t.update(playerB_Ref, { bonusMatchUsed: true });
+
+    const platformCoins = platformDoc.exists
+      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
+    t.set(platformRef, {
+      totalCoins:  inc(platformCoins, dPlat),
+      lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
 
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
@@ -1004,7 +1134,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    // RC = 30% of entry fee. Not granted to non-submitter (rage quitter).
+    // RC only for winner, only if bonusMatchUsed, only if winner is not the non-submitter
     const rcEarnedAR     = Math.floor(match.entryFee * 0.30);
     const bonusMatchUsed = winnerData.bonusMatchUsed === true;
 
@@ -1013,7 +1143,6 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
       t.update(winnerRef, { rcBalance: currentRcAR + rcEarnedAR });
     }
 
-    // Mark bonus match as used for both players
     if (!winnerData.bonusMatchUsed) t.update(winnerRef, { bonusMatchUsed: true });
     if (!loserData.bonusMatchUsed)  t.update(loserRef,  { bonusMatchUsed: true });
 
@@ -1025,8 +1154,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     }
 
     const platformCoins = platformDoc.exists
-      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0)
-      : 0;
+      ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, {
       totalCoins:  inc(platformCoins, plat),
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
@@ -1039,7 +1167,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     rewarded:           true,
     winnerReward:       confirmedWinner === "draw" ? 0 : winner,
     loserReward:        confirmedWinner === "draw" ? 0 : loser,
-    platformFee:        confirmedWinner === "draw" ? 0 : plat,
+    platformFee:        confirmedWinner === "draw" ? dPlat : plat,
     confirmedAt:        admin.firestore.FieldValue.serverTimestamp(),
     rematchRequestedBy: null,
     rematchStatus:      null,
@@ -1056,23 +1184,23 @@ app.get("/",       (_req, res) => res.send("Duelix backend is live"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // =============================================================
-// STORE — VERIFY PURCHASE
-// Coins credited ONLY after backend Paystack verification.
-// Duplicate references are blocked (409).
-// Referral reward granted here on FIRST purchase only.
+// STORE — INITIALIZE PURCHASE
+// Step 1: Flutter sends packageId + user email.
+// Backend calls Paystack /transaction/initialize.
+// Returns authorization_url + reference to Flutter.
+// Flutter opens authorization_url in browser/WebView.
 // =============================================================
-app.post("/store/verify-purchase", verifyToken, async (req, res) => {
-  const { reference, packageId } = req.body;
+app.post("/store/initialize-purchase", verifyToken, async (req, res) => {
+  const { packageId, email } = req.body;
   const uid = req.user.uid;
 
-  if (!reference || typeof reference !== "string" || !reference.trim()) {
-    return res.status(400).json({ error: "reference is required" });
-  }
   if (!packageId || typeof packageId !== "string" || !packageId.trim()) {
     return res.status(400).json({ error: "packageId is required" });
   }
+  if (!email || typeof email !== "string" || !email.trim()) {
+    return res.status(400).json({ error: "email is required" });
+  }
 
-  const safeRef       = reference.trim();
   const safePackageId = packageId.trim();
   const pkg           = COIN_PACKAGES[safePackageId];
 
@@ -1080,8 +1208,63 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     return res.status(400).json({ error: "Unknown package: " + safePackageId });
   }
 
+  // Generate unique reference: duelix_uid_timestamp_random
+  const reference = "duelix_" + uid.substring(0, 8) + "_" +
+    Date.now() + "_" + Math.random().toString(36).substring(2, 8);
+
   try {
-    // Block duplicate Paystack references
+    const paystackData = await initializePaystackTransaction(
+      email.trim(),
+      pkg.koboAmount,
+      pkg.currency,
+      reference,
+      { uid, packageId: safePackageId, packageLabel: pkg.label, coins: pkg.coins }
+    );
+
+    // Store pending transaction so we can validate reference on verify
+    const pendingRef = db.collection("pending_purchases").doc(reference);
+    await pendingRef.set({
+      uid,
+      packageId:    safePackageId,
+      packageLabel: pkg.label,
+      coins:        pkg.coins,
+      amountKobo:   pkg.koboAmount,
+      currency:     pkg.currency,
+      reference,
+      status:       "pending",
+      createdAt:    admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.json({
+      authorization_url: paystackData.authorization_url,
+      reference:         paystackData.reference || reference,
+      access_code:       paystackData.access_code || null,
+    });
+  } catch (err) {
+    console.error("[store/initialize] uid=" + uid + ":", err.message);
+    return res.status(502).json({ error: "Payment initialization failed: " + err.message });
+  }
+});
+
+// =============================================================
+// STORE — VERIFY PURCHASE
+// Step 2: After browser payment, Flutter calls this with reference.
+// Backend verifies with Paystack, credits coins atomically.
+// Duplicate references blocked (409).
+// Referral reward granted on first purchase only.
+// =============================================================
+app.post("/store/verify-purchase", verifyToken, async (req, res) => {
+  const { reference } = req.body;
+  const uid = req.user.uid;
+
+  if (!reference || typeof reference !== "string" || !reference.trim()) {
+    return res.status(400).json({ error: "reference is required" });
+  }
+
+  const safeRef = reference.trim();
+
+  try {
+    // Block duplicate processing
     const existingPurchase = await db
       .collection("coin_purchases")
       .where("reference", "==", safeRef)
@@ -1092,11 +1275,33 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
       const userDoc     = await db.collection("users").doc(uid).get();
       const coinBalance = userDoc.exists && userDoc.data().coins != null
         ? userDoc.data().coins : 0;
+      const rcBalance   = userDoc.exists && userDoc.data().rcBalance != null
+        ? userDoc.data().rcBalance : 0;
       return res.status(409).json({
         error:          "This payment has already been processed.",
         newCoinBalance: coinBalance,
-        coinsAdded:     pkg.coins,
+        newRcBalance:   rcBalance,
       });
+    }
+
+    // Look up pending purchase to validate packageId server-side
+    const pendingDoc = await db.collection("pending_purchases").doc(safeRef).get();
+    if (!pendingDoc.exists) {
+      return res.status(400).json({
+        error: "No pending purchase found for this reference. Please initialize a purchase first.",
+      });
+    }
+
+    const pendingData = pendingDoc.data();
+
+    // Validate this reference belongs to this user
+    if (pendingData.uid !== uid) {
+      return res.status(403).json({ error: "Reference does not belong to this account." });
+    }
+
+    const pkg = COIN_PACKAGES[pendingData.packageId];
+    if (!pkg) {
+      return res.status(400).json({ error: "Unknown package in pending record." });
     }
 
     // Verify with Paystack
@@ -1118,6 +1323,7 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     const chargedAmount   = Number(paystackData.amount)   || 0;
     const chargedCurrency = (paystackData.currency || "").toUpperCase();
 
+    // Validate amount and currency match the package
     if (chargedAmount < pkg.koboAmount) {
       return res.status(400).json({
         error: "Payment amount does not match the selected package.",
@@ -1130,6 +1336,7 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     }
 
     let newCoinBalance  = 0;
+    let newRcBalance    = 0;
     let isFirstPurchase = false;
 
     await db.runTransaction(async (t) => {
@@ -1138,24 +1345,25 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
       if (!userDoc.exists) throw new Error("User not found");
 
       const userData         = userDoc.data();
-      const currentCoins     = userData.coins != null ? Number(userData.coins) : 0;
+      const currentCoins     = userData.coins     != null ? Number(userData.coins)     : 0;
+      const currentRc        = userData.rcBalance != null ? Number(userData.rcBalance) : 0;
       const safeCurrentCoins = Math.max(0, currentCoins);
       newCoinBalance         = safeCurrentCoins + pkg.coins;
+      newRcBalance           = currentRc;
 
-      // Track first purchase for referral reward trigger
       isFirstPurchase = !userData.firstPurchaseDone;
 
       t.update(userRef, {
-        coins:            newCoinBalance,
+        coins:             newCoinBalance,
         firstPurchaseDone: true,
-        updatedAt:        admin.firestore.FieldValue.serverTimestamp(),
+        updatedAt:         admin.firestore.FieldValue.serverTimestamp(),
       });
 
       const purchaseRef = db.collection("coin_purchases").doc();
       t.set(purchaseRef, {
         id:            purchaseRef.id,
         userId:        uid,
-        packageId:     safePackageId,
+        packageId:     pendingData.packageId,
         packageLabel:  pkg.label,
         coinsAdded:    pkg.coins,
         reference:     safeRef,
@@ -1164,11 +1372,18 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
         status:        "completed",
         paystackEmail: paystackData.customer && paystackData.customer.email
           ? paystackData.customer.email : null,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+        createdAt:     admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      // Mark pending purchase as completed
+      const pendingRef = db.collection("pending_purchases").doc(safeRef);
+      t.update(pendingRef, {
+        status:      "completed",
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
 
-    // Grant referral reward ONLY after first successful purchase
+    // Grant referral reward only after first successful purchase
     if (isFirstPurchase) {
       tryGrantReferralReward(uid).catch((e) =>
         console.error("[store/verify] referral grant error:", e.message)
@@ -1178,10 +1393,13 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     notifyCoinPurchase(uid, pkg.coins, newCoinBalance, pkg.label)
       .catch((e) => console.error("[store/verify] notify error:", e.message));
 
+    console.log("[store/verify] uid=" + uid + " coins+" + pkg.coins + " ref=" + safeRef);
+
     return res.json({
       message:        "Purchase verified and coins credited",
       coinsAdded:     pkg.coins,
       newCoinBalance: newCoinBalance,
+      newRcBalance:   newRcBalance,
     });
 
   } catch (err) {
@@ -1206,6 +1424,7 @@ app.get("/rc/balance/:uid", verifyToken, async (req, res) => {
 
 // =============================================================
 // RC REDEEM
+// Min 200 RC. Must be multiple of 100. Cannot exceed balance.
 // =============================================================
 app.post("/rc/redeem", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1437,9 +1656,8 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // CREATE USER PROFILE
-// Signup bonus: 10 coins (reduced from 20).
-// bonusMatchUsed: false — first match played with bonus coins
-// earns no RC. Set to true after the first match completes.
+// Signup bonus: 20 coins.
+// bonusMatchUsed: false — first match earns no RC.
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1456,24 +1674,22 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
   }
 
-  // Anti-fraud: check IP and device for abuse
   const ipAddress = req.headers["x-forwarded-for"]
     ? String(req.headers["x-forwarded-for"]).split(",")[0].trim()
     : req.socket.remoteAddress || null;
 
   try {
-    // Block abusive IPs
     if (ipAddress && await isIpAbusive(ipAddress)) {
       return res.status(429).json({
         error: "Too many accounts registered from this network. Please contact support.",
       });
     }
 
-    // Warn on suspicious device (soft block — log only, don't reject)
     const deviceCount = await countAccountsByDevice(deviceId, installId);
     if (deviceCount >= 3) {
       console.warn("[create-profile] Suspicious device: deviceId=" + deviceId +
         " installId=" + installId + " existingAccounts=" + deviceCount);
+      detectSuspiciousActivity(uid, "multi_account_device count=" + deviceCount).catch(() => {});
     }
 
     const userRef      = db.collection("users").doc(uid);
@@ -1494,36 +1710,35 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 
       t.set(userRef, Object.assign({
         uid,
-        displayName:         name,
+        displayName:           name,
         phone,
-        email:               email != null ? email : "",
-        coins:               10,           // Signup bonus: 10 coins
-        wins:                0,
-        losses:              0,
-        draws:               0,
-        totalMatches:        0,
-        loginStreak:         0,
-        lastLogin:           null,
-        avatar:              "assets/avatars/avatar1.png",
+        email:                 email != null ? email : "",
+        coins:                 20,
+        wins:                  0,
+        losses:                0,
+        draws:                 0,
+        totalMatches:          0,
+        loginStreak:           0,
+        lastLogin:             null,
+        avatar:                "assets/avatars/avatar1.png",
         referralCode,
-        referredBy:          null,
-        referredByName:      null,
-        referralCount:       0,
-        referralRewardGranted: false,      // Referral reward not yet granted
-        firstPurchaseDone:   false,        // Tracks first coin purchase
-        bonusMatchUsed:      false,        // First match gets no RC
-        fcmToken:            null,
-        deviceId:            deviceId   || null,
-        installId:           installId  || null,
-        createdAt:           admin.firestore.FieldValue.serverTimestamp(),
+        referredBy:            null,
+        referredByName:        null,
+        referralCount:         0,
+        referralRewardGranted: false,
+        firstPurchaseDone:     false,
+        bonusMatchUsed:        false,
+        fcmToken:              null,
+        deviceId:              deviceId  || null,
+        installId:             installId || null,
+        createdAt:             admin.firestore.FieldValue.serverTimestamp(),
       }, DEFAULT_TRUST_FIELDS));
     });
 
-    // Record device fingerprint for anti-fraud tracking
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
 
     notifyUser(uid, "system", "Welcome to Duelix!",
-      "Your account is ready. You have been given 10 coins to start. Good luck!", {}
+      "Your account is ready. You have been given 20 coins to start. Good luck!", {}
     ).catch(() => {});
 
     return res.status(201).json({ message: "Profile created", uid, referralCode });
@@ -1544,8 +1759,7 @@ app.get("/user-exists/:uid", async (req, res) => {
 // =============================================================
 // REFERRAL SYSTEM
 // apply-referral stores the referral link on signup.
-// The actual coin reward fires only after first purchase
-// via tryGrantReferralReward() in /store/verify-purchase.
+// Coin reward fires only after first purchase.
 // =============================================================
 app.post("/apply-referral", verifyToken, async (req, res) => {
   const currentUid       = req.user.uid;
@@ -1577,13 +1791,11 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
       if (!currentDoc.exists)           throw new Error("Your account was not found");
       if (currentDoc.data().referredBy) throw new Error("ALREADY_REFERRED");
 
-      // Store the referral link only — reward granted on first purchase
       t.update(currentRef, {
         referredBy:     referrerUid,
         referredByName: referrerData.displayName || "A friend",
       });
 
-      // Increment referrer's count (no coins yet)
       const referrerRef = db.collection("users").doc(referrerUid);
       const referrerDoc = await t.get(referrerRef);
       if (referrerDoc.exists) {
@@ -1618,23 +1830,23 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
 
     if (data.trustScore === undefined) {
       const trustFields = {
-        trustScore:          80,
-        completedMatches:    data.completedMatches != null ? data.completedMatches : 0,
-        cancelledMatches:    data.cancelledMatches != null ? data.cancelledMatches : 0,
-        disputesLost:        data.disputesLost     != null ? data.disputesLost     : 0,
-        reportsReceived:     data.reportsReceived  != null ? data.reportsReceived  : 0,
-        fakeResults:         data.fakeResults      != null ? data.fakeResults      : 0,
-        rageQuits:           data.rageQuits        != null ? data.rageQuits        : 0,
-        fairPlayRating:      100,
-        matchCompletionRate: 0,
-        cleanMatchBonus:     0,
-        fairPlayBonus:       0,
-        rcBalance:           data.rcBalance != null ? data.rcBalance : 0,
-        bonusMatchUsed:      data.bonusMatchUsed   != null ? data.bonusMatchUsed   : false,
-        firstPurchaseDone:   data.firstPurchaseDone != null ? data.firstPurchaseDone : false,
+        trustScore:            80,
+        completedMatches:      data.completedMatches     != null ? data.completedMatches     : 0,
+        cancelledMatches:      data.cancelledMatches     != null ? data.cancelledMatches     : 0,
+        disputesLost:          data.disputesLost         != null ? data.disputesLost         : 0,
+        reportsReceived:       data.reportsReceived      != null ? data.reportsReceived      : 0,
+        fakeResults:           data.fakeResults          != null ? data.fakeResults          : 0,
+        rageQuits:             data.rageQuits            != null ? data.rageQuits            : 0,
+        fairPlayRating:        100,
+        matchCompletionRate:   0,
+        cleanMatchBonus:       0,
+        fairPlayBonus:         0,
+        rcBalance:             data.rcBalance            != null ? data.rcBalance            : 0,
+        bonusMatchUsed:        data.bonusMatchUsed       != null ? data.bonusMatchUsed       : false,
+        firstPurchaseDone:     data.firstPurchaseDone    != null ? data.firstPurchaseDone    : false,
         referralRewardGranted: data.referralRewardGranted != null ? data.referralRewardGranted : false,
-        onlineStatus:        data.onlineStatus   != null ? data.onlineStatus   : true,
-        friendRequests:      data.friendRequests != null ? data.friendRequests : true,
+        onlineStatus:          data.onlineStatus         != null ? data.onlineStatus         : true,
+        friendRequests:        data.friendRequests       != null ? data.friendRequests       : true,
       };
       db.collection("users").doc(req.params.uid)
         .set(trustFields, { merge: true })
@@ -1643,11 +1855,11 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     }
 
     const needsPatch =
-      data.cleanMatchBonus      === undefined ||
-      data.fairPlayBonus        === undefined ||
-      data.rcBalance            === undefined ||
-      data.bonusMatchUsed       === undefined ||
-      data.firstPurchaseDone    === undefined ||
+      data.cleanMatchBonus       === undefined ||
+      data.fairPlayBonus         === undefined ||
+      data.rcBalance             === undefined ||
+      data.bonusMatchUsed        === undefined ||
+      data.firstPurchaseDone     === undefined ||
       data.referralRewardGranted === undefined;
 
     if (needsPatch) {
@@ -1754,7 +1966,7 @@ app.post("/add-coins", verifyToken, async (req, res) => {
 app.post("/reset-account", verifyToken, async (req, res) => {
   const { coins }  = req.body;
   const resetCoins = (coins != null && Number.isInteger(coins) && coins >= 0 && coins <= 100000)
-    ? coins : 10;
+    ? coins : 20;
   try {
     await db.collection("users").doc(req.user.uid).update({
       coins: resetCoins, wins: 0, losses: 0, draws: 0, totalMatches: 0,
@@ -2092,8 +2304,8 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
     if (matchSnapshot) {
       const w = result.confirmedWinner;
       if (w === "draw") {
-        notifyMatchDraw(matchSnapshot.playerA, matchId, matchSnapshot.entryFee).catch(() => {});
-        notifyMatchDraw(matchSnapshot.playerB, matchId, matchSnapshot.entryFee).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
       } else {
         const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
         notifyMatchWon(w,         matchId, result.winner).catch(() => {});
@@ -2266,8 +2478,8 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       notifyAutoResolved(matchSnapshot.playerB, matchId, w).catch(() => {});
 
       if (w === "draw") {
-        notifyMatchDraw(matchSnapshot.playerA, matchId, matchSnapshot.entryFee).catch(() => {});
-        notifyMatchDraw(matchSnapshot.playerB, matchId, matchSnapshot.entryFee).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
+        notifyMatchDraw(matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
       } else {
         const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
         notifyMatchWon(w,         matchId, result.winner).catch(() => {});
@@ -2315,11 +2527,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const playerA_Data = playerA_Doc.data();
       const playerB_Data = playerB_Doc.data();
 
-      // Refund both players
       t.update(playerA_Ref, { coins: inc(playerA_Data.coins, match.entryFee) });
       t.update(playerB_Ref, { coins: inc(playerB_Data.coins, match.entryFee) });
 
-      // Apply rage quit penalty to both (neither submitted)
       const aUpdated = Object.assign({}, playerA_Data, { rageQuits: inc(playerA_Data.rageQuits) });
       const bUpdated = Object.assign({}, playerB_Data, { rageQuits: inc(playerB_Data.rageQuits) });
       t.update(playerA_Ref, { rageQuits: inc(playerA_Data.rageQuits) });
@@ -2398,7 +2608,7 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         ? matchDoc.data().rematchRequestedBy : null;
 
       await db.collection("matches").doc(matchId).update({
-        rematchStatus: "declined",
+        rematchStatus:     "declined",
         rematchDeclinedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
@@ -2601,14 +2811,14 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
         try {
           const data = doc.data();
           batch.set(doc.ref, {
-            trustScore:          computeTrustScore(data),
-            fairPlayRating:      computeFairPlayRating(data),
-            matchCompletionRate: computeCompletionRate(data),
-            rcBalance:           data.rcBalance       != null ? data.rcBalance       : 0,
-            bonusMatchUsed:      data.bonusMatchUsed  != null ? data.bonusMatchUsed  : false,
-            firstPurchaseDone:   data.firstPurchaseDone != null ? data.firstPurchaseDone : false,
+            trustScore:            computeTrustScore(data),
+            fairPlayRating:        computeFairPlayRating(data),
+            matchCompletionRate:   computeCompletionRate(data),
+            rcBalance:             data.rcBalance             != null ? data.rcBalance             : 0,
+            bonusMatchUsed:        data.bonusMatchUsed        != null ? data.bonusMatchUsed        : false,
+            firstPurchaseDone:     data.firstPurchaseDone     != null ? data.firstPurchaseDone     : false,
             referralRewardGranted: data.referralRewardGranted != null ? data.referralRewardGranted : false,
-            trustUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
+            trustUpdatedAt:        admin.firestore.FieldValue.serverTimestamp(),
           }, { merge: true });
           migrated++;
         } catch (e) { errors++; }

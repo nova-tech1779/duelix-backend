@@ -1190,7 +1190,7 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 // Returns authorization_url + reference to Flutter.
 // Flutter opens authorization_url in browser/WebView.
 // =============================================================
-app.post("/store/initialize-purchase", verifyToken, async (req, res) => {
+app.post("/store/initialize-payment", verifyToken, async (req, res) => {
   const { packageId, email } = req.body;
   const uid = req.user.uid;
 
@@ -1236,7 +1236,7 @@ app.post("/store/initialize-purchase", verifyToken, async (req, res) => {
     });
 
     return res.json({
-      authorization_url: paystackData.authorization_url,
+      authorization_url: paystackData.authorizationUrl,
       reference:         paystackData.reference || reference,
       access_code:       paystackData.access_code || null,
     });
@@ -1253,7 +1253,7 @@ app.post("/store/initialize-purchase", verifyToken, async (req, res) => {
 // Duplicate references blocked (409).
 // Referral reward granted on first purchase only.
 // =============================================================
-app.post("/store/verify-purchase", verifyToken, async (req, res) => {
+app.post("/store/verify-payment", verifyToken, async (req, res) => {
   const { reference } = req.body;
   const uid = req.user.uid;
 

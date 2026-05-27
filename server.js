@@ -1236,7 +1236,7 @@ app.post("/store/initialize-payment", verifyToken, async (req, res) => {
     });
 
     return res.json({
-      authorization_url: paystackData.authorizationUrl,
+      authorization_url: paystackData.authorization_url,
       reference:         paystackData.reference || reference,
       access_code:       paystackData.access_code || null,
     });

@@ -8,6 +8,7 @@ process.on("unhandledRejection", (err) => {
 
 const express = require("express");
 const cors    = require("cors");
+const crypto  = require("crypto");
 const dotenv  = require("dotenv");
 dotenv.config();
 
@@ -37,6 +38,13 @@ app.use(cors({
   allowedHeaders: "*",
 }));
 
+// =============================================================
+// BODY PARSING
+// IMPORTANT: The webhook endpoint needs the raw body for HMAC
+// signature verification. We mount it BEFORE express.json() so
+// it receives the raw Buffer. All other routes use express.json().
+// =============================================================
+app.use("/paystack/webhook", express.raw({ type: "application/json" }));
 app.use(express.json());
 
 app.use((_req, res, next) => {
@@ -83,17 +91,10 @@ async function uniqueReferralCode() {
 // =============================================================
 // NEW MATCH ECONOMY
 // Pool = entryFee * 2
-// Winner = 65% of pool
-// Loser  = 5%  of pool
-// Platform = 15% of pool (remaining after winner + loser)
-//
-// Examples (entry=50):
-//   pool=100, winner=65, loser=5, platform=15+15=30 (but we keep it simple below)
-//
-// Exact formula per spec:
-//   winner = entryFee * 1.30  (130% of one side = 65% of pool)
-//   loser  = entryFee * 0.10  (10%  of one side = 5%  of pool)
-//   platform = pool - winner - loser
+// Winner = entryFee * 1.30 (130% of one side = 65% of pool)
+// Loser  = entryFee * 0.10 (10%  of one side = 5%  of pool)
+// Platform = pool - winner - loser
+// Draw: both refunded 90% of entry fee. Platform keeps 10%.
 // =============================================================
 const pool         = (entryFee) => entryFee * 2;
 const winnerReward = (entryFee) => Math.floor(entryFee * 1.30);
@@ -101,7 +102,6 @@ const loserReward  = (entryFee) => Math.floor(entryFee * 0.10);
 const platformFee  = (entryFee) =>
   pool(entryFee) - winnerReward(entryFee) - loserReward(entryFee);
 
-// Draw: both players refunded 90% of entry fee. Platform keeps 10%.
 const drawRefund      = (entryFee) => Math.floor(entryFee * 0.90);
 const drawPlatformFee = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
 
@@ -127,9 +127,6 @@ function hasSubmittedResult(match) {
 
 // =============================================================
 // COIN PACKAGE CATALOGUE
-// $0.50 → 50  | $1.00 → 105 | $2.00 → 215
-// $5.00 → 550 | $10.00 → 1150 | $20.00 → 2400
-// Amounts in pesewas (GHS smallest unit, like kobo for NGN)
 // =============================================================
 const COIN_PACKAGES = {
   "coins_50": {
@@ -417,15 +414,18 @@ async function tryGrantReferralReward(uid) {
 
     const referrerUid = user.referredBy;
 
-    // Anti-farming: warn if referrer and referee share device
     const deviceSnap = await db.collection("device_fingerprints")
       .where("uid", "==", referrerUid).limit(3).get();
-    const referrerDevices = new Set(deviceSnap.docs.map((d) => d.data().deviceId).filter(Boolean));
-    const userDeviceSnap  = await db.collection("device_fingerprints")
+    const referrerDevices = new Set(
+      deviceSnap.docs.map((d) => d.data().deviceId).filter(Boolean)
+    );
+    const userDeviceSnap = await db.collection("device_fingerprints")
       .where("uid", "==", uid).limit(3).get();
     userDeviceSnap.docs.forEach((d) => {
       if (d.data().deviceId && referrerDevices.has(d.data().deviceId)) {
-        detectSuspiciousActivity(uid, "referral_same_device referrer=" + referrerUid).catch(() => {});
+        detectSuspiciousActivity(
+          uid, "referral_same_device referrer=" + referrerUid
+        ).catch(() => {});
       }
     });
 
@@ -452,8 +452,12 @@ async function tryGrantReferralReward(uid) {
       });
     });
 
-    notifyReferralBonus(uid, 5, userDoc.data().referredByName || "A friend").catch(() => {});
-    notifyReferrerReward(referrerUid, 5, user.displayName || "A new player").catch(() => {});
+    notifyReferralBonus(
+      uid, 5, userDoc.data().referredByName || "A friend"
+    ).catch(() => {});
+    notifyReferrerReward(
+      referrerUid, 5, user.displayName || "A new player"
+    ).catch(() => {});
 
     console.log("[referral] reward granted uid=" + uid + " referrer=" + referrerUid);
   } catch (err) {
@@ -462,10 +466,7 @@ async function tryGrantReferralReward(uid) {
 }
 
 // =============================================================
-// PAYSTACK — INITIALIZE TRANSACTION (browser authorization flow)
-// Returns { authorization_url, reference } to Flutter.
-// Flutter opens authorization_url in a WebView/browser.
-// After payment, Flutter calls /store/verify-purchase with reference.
+// PAYSTACK — INITIALIZE TRANSACTION
 // =============================================================
 function initializePaystackTransaction(email, amountInPesewas, currency, reference, metadata) {
   return new Promise((resolve, reject) => {
@@ -475,10 +476,10 @@ function initializePaystackTransaction(email, amountInPesewas, currency, referen
 
     const body = JSON.stringify({
       email,
-      amount:    amountInPesewas,
+      amount:       amountInPesewas,
       currency,
       reference,
-      metadata: metadata || {},
+      metadata:     metadata || {},
       callback_url: "https://duelix-app.web.app/payment-callback",
     });
 
@@ -488,8 +489,8 @@ function initializePaystackTransaction(email, amountInPesewas, currency, referen
       path:     "/transaction/initialize",
       method:   "POST",
       headers: {
-        "Authorization": "Bearer " + PAYSTACK_SECRET_KEY,
-        "Content-Type":  "application/json",
+        "Authorization":  "Bearer " + PAYSTACK_SECRET_KEY,
+        "Content-Type":   "application/json",
         "Content-Length": Buffer.byteLength(body),
       },
     };
@@ -500,6 +501,8 @@ function initializePaystackTransaction(email, amountInPesewas, currency, referen
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
+          console.log("[initializePaystack] raw response status=" + parsed.status +
+            " message=" + parsed.message);
           if (!parsed.status) {
             return reject(new Error(
               "Paystack init failed: " + (parsed.message || "unknown error")
@@ -552,9 +555,18 @@ function verifyPaystackTransaction(reference) {
       res.on("end", () => {
         try {
           const parsed = JSON.parse(data);
+          console.log("[verifyPaystack] ref=" + reference +
+            " status=" + parsed.status +
+            " txStatus=" + (parsed.data ? parsed.data.status : "n/a"));
+
           if (!parsed.status) {
             return reject(new Error(
               "Paystack verification failed: " + (parsed.message || "unknown error")
+            ));
+          }
+          if (!parsed.data) {
+            return reject(new Error(
+              "Paystack verification returned no data for ref=" + reference
             ));
           }
           resolve(parsed.data);
@@ -575,6 +587,86 @@ function verifyPaystackTransaction(reference) {
 
     req.end();
   });
+}
+
+// =============================================================
+// SHARED COIN-CREDIT LOGIC
+// Used by both /store/verify-purchase AND the webhook so the
+// crediting logic is never duplicated.
+//
+// Returns { newCoinBalance, newRcBalance, coinsAdded, isFirstPurchase }
+// or throws if the reference was already processed.
+//
+// safe = true  → caller already checked for duplicates (webhook
+//               path uses a Firestore transaction lock instead).
+// =============================================================
+async function creditCoinsForReference(safeRef, uid, pkg, paystackEmail) {
+  let newCoinBalance  = 0;
+  let newRcBalance    = 0;
+  let isFirstPurchase = false;
+
+  await db.runTransaction(async (t) => {
+    // Re-check for duplicate inside the transaction to prevent races
+    const dupSnap = await db
+      .collection("coin_purchases")
+      .where("reference", "==", safeRef)
+      .limit(1)
+      .get();
+    if (!dupSnap.empty) {
+      // Already credited — signal to caller via a sentinel error
+      throw new Error("ALREADY_CREDITED");
+    }
+
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await t.get(userRef);
+    if (!userDoc.exists) throw new Error("User not found for uid=" + uid);
+
+    const userData         = userDoc.data();
+    const currentCoins     = userData.coins     != null ? Number(userData.coins)     : 0;
+    const currentRc        = userData.rcBalance != null ? Number(userData.rcBalance) : 0;
+    const safeCurrentCoins = Math.max(0, currentCoins);
+
+    newCoinBalance  = safeCurrentCoins + pkg.coins;
+    newRcBalance    = currentRc;
+    isFirstPurchase = !userData.firstPurchaseDone;
+
+    t.update(userRef, {
+      coins:             newCoinBalance,
+      firstPurchaseDone: true,
+      updatedAt:         admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const purchaseRef = db.collection("coin_purchases").doc();
+    t.set(purchaseRef, {
+      id:             purchaseRef.id,
+      userId:         uid,
+      packageId:      pkg.id || "",
+      packageLabel:   pkg.label,
+      coinsAdded:     pkg.coins,
+      newCoinBalance: newCoinBalance,
+      reference:      safeRef,
+      amountCharged:  pkg.amountCharged || 0,
+      currency:       pkg.chargedCurrency || pkg.currency,
+      status:         "completed",
+      paystackEmail:  paystackEmail || null,
+      source:         pkg.source || "verify",
+      createdAt:      admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const pendingRef = db.collection("pending_purchases").doc(safeRef);
+    // Only update pending if it exists — webhook may fire before Flutter
+    // calls initialize in rare cases, so guard with a get first
+    const pendingDoc = await t.get(pendingRef);
+    if (pendingDoc.exists) {
+      t.update(pendingRef, {
+        status:      "completed",
+        completedAt: admin.firestore.FieldValue.serverTimestamp(),
+        completedBy: pkg.source || "verify",
+      });
+    }
+  });
+
+  return { newCoinBalance, newRcBalance, isFirstPurchase };
 }
 
 // =============================================================
@@ -697,13 +789,17 @@ async function createNotification(userId, type, title, message, meta) {
       meta:      safeMeta,
     });
   } catch (err) {
-    console.error("[createNotification] type=" + type + " uid=" + userId + " err=" + err.message);
+    console.error(
+      "[createNotification] type=" + type + " uid=" + userId + " err=" + err.message
+    );
   }
 }
 
 async function notifyUser(userId, type, title, message, meta) {
   await createNotification(userId, type, title, message, meta || {});
-  const pushData = Object.assign({}, (meta && typeof meta === "object") ? meta : {}, { type });
+  const pushData = Object.assign(
+    {}, (meta && typeof meta === "object") ? meta : {}, { type }
+  );
   await sendPushNotification(userId, title, message, pushData);
 }
 
@@ -836,7 +932,8 @@ function notifyRematchDeclined(userId, matchId) {
 function notifyReferralBonus(userId, bonusCoins, referrerName) {
   return notifyUser(
     userId, "referral", "Referral bonus unlocked!",
-    "You used " + referrerName + "'s referral code and earned +" + bonusCoins + " bonus coins after your first purchase.",
+    "You used " + referrerName + "'s referral code and earned +" + bonusCoins +
+      " bonus coins after your first purchase.",
     { bonusCoins, referrerName, event: "new_user_bonus" }
   );
 }
@@ -844,7 +941,8 @@ function notifyReferralBonus(userId, bonusCoins, referrerName) {
 function notifyReferrerReward(referrerUid, rewardCoins, newUserName) {
   return notifyUser(
     referrerUid, "referral", "Referral reward unlocked!",
-    newUserName + " completed their first purchase using your referral code. You earned +" + rewardCoins + " coins!",
+    newUserName + " completed their first purchase using your referral code. You earned +" +
+      rewardCoins + " coins!",
     { rewardCoins, newUserName, event: "referrer_reward" }
   );
 }
@@ -852,7 +950,8 @@ function notifyReferrerReward(referrerUid, rewardCoins, newUserName) {
 function notifyCoinPurchase(userId, coinsAdded, newBalance, packageLabel) {
   return notifyUser(
     userId, "purchase_successful", "Coin Purchase Successful",
-    "Your purchase was successful. " + coinsAdded + " Coins (" + packageLabel + ") have been added to your account.",
+    "Your purchase was successful. " + coinsAdded + " Coins (" + packageLabel +
+      ") have been added to your account.",
     { coinsAdded, newBalance, packageLabel }
   );
 }
@@ -890,24 +989,11 @@ function notifyRoomTimer(userId, matchId, alertType) {
 
 // =============================================================
 // REWARD DISTRIBUTION — CONFIRM-RESULT PATH
-//
-// New economy:
-//   winner = 130% of entry fee (entryFee * 1.30, floored)
-//   loser  = 10%  of entry fee (entryFee * 0.10, floored)
-//   platform = remainder
-//
-// Draw: both refunded 90% of entry fee. No RC for draws.
-//
-// RC = 30% of entry fee (floored). Winners only.
-// RC NOT granted if bonusMatchUsed === false (first free match).
-// bonusMatchUsed set to true after first match for both players.
-//
-// Signup bonus coins NEVER generate RC (bonusMatchUsed guard).
 // =============================================================
 async function distributeReward(t, match, matchRef, confirmedWinner) {
-  const winner = winnerReward(match.entryFee);
-  const loser  = loserReward(match.entryFee);
-  const plat   = platformFee(match.entryFee);
+  const winner  = winnerReward(match.entryFee);
+  const loser   = loserReward(match.entryFee);
+  const plat    = platformFee(match.entryFee);
   const dRefund = drawRefund(match.entryFee);
   const dPlat   = drawPlatformFee(match.entryFee);
 
@@ -929,7 +1015,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
-    // Draw: refund 90% each, no RC
     const aUpdated = Object.assign({}, playerA_Data, {
       completedMatches: inc(playerA_Data.completedMatches),
       totalMatches:     inc(playerA_Data.totalMatches),
@@ -955,7 +1040,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     applyCleanMatchReward(t, playerA_Ref, aUpdated);
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
 
-    // Mark bonusMatchUsed for both
     if (!playerA_Data.bonusMatchUsed) t.update(playerA_Ref, { bonusMatchUsed: true });
     if (!playerB_Data.bonusMatchUsed) t.update(playerB_Ref, { bonusMatchUsed: true });
 
@@ -997,8 +1081,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    // RC = 30% of entry fee. Only for winner. Only if bonusMatchUsed === true.
-    // Signup bonus coins = bonusMatchUsed is false → no RC that match.
     const rcEarned       = Math.floor(match.entryFee * 0.30);
     const bonusMatchUsed = winnerData.bonusMatchUsed === true;
 
@@ -1007,7 +1089,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       t.update(winnerRef, { rcBalance: currentRc + rcEarned });
     }
 
-    // Mark bonusMatchUsed after first match for both players
     if (!winnerData.bonusMatchUsed) t.update(winnerRef, { bonusMatchUsed: true });
     if (!loserData.bonusMatchUsed)  t.update(loserRef,  { bonusMatchUsed: true });
 
@@ -1040,8 +1121,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION — AUTO-RESOLVE PATH
-// Same economy as confirm path.
-// RC NOT granted to non-submitter (rage quitter).
 // =============================================================
 async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, nonSubmitterUid) {
   const winner  = winnerReward(match.entryFee);
@@ -1134,7 +1213,6 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    // RC only for winner, only if bonusMatchUsed, only if winner is not the non-submitter
     const rcEarnedAR     = Math.floor(match.entryFee * 0.30);
     const bonusMatchUsed = winnerData.bonusMatchUsed === true;
 
@@ -1184,11 +1262,240 @@ app.get("/",       (_req, res) => res.send("Duelix backend is live"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // =============================================================
-// STORE — INITIALIZE PURCHASE
-// Step 1: Flutter sends packageId + user email.
-// Backend calls Paystack /transaction/initialize.
-// Returns authorization_url + reference to Flutter.
-// Flutter opens authorization_url in browser/WebView.
+// PAYSTACK WEBHOOK
+//
+// Paystack calls this endpoint automatically after every payment
+// event. This is the primary automatic coin-crediting path —
+// it fires even when the user closes the app after paying.
+//
+// Security:
+//   • express.raw() is applied ONLY to this route (see top of
+//     file) so the raw Buffer is available for HMAC verification.
+//   • We verify the x-paystack-signature header using HMAC-SHA512
+//     of the raw request body signed with PAYSTACK_SECRET_KEY.
+//   • Any request with an invalid or missing signature returns 400
+//     immediately — no processing occurs.
+//
+// Duplicate safety:
+//   • creditCoinsForReference() re-checks coin_purchases inside a
+//     Firestore transaction, so even if Paystack retries the webhook
+//     multiple times the coins are credited exactly once.
+//
+// Supported events:
+//   • charge.success  → credit coins
+//   • everything else → acknowledged with 200, no action taken
+// =============================================================
+app.post("/paystack/webhook", async (req, res) => {
+  // ── 1. Signature verification ──────────────────────────────
+  const signature = req.headers["x-paystack-signature"];
+
+  if (!PAYSTACK_SECRET_KEY) {
+    console.error("[webhook] PAYSTACK_SECRET_KEY not configured");
+    return res.status(500).send("Server misconfiguration");
+  }
+
+  if (!signature) {
+    console.warn("[webhook] Missing x-paystack-signature header");
+    return res.status(400).send("Missing signature");
+  }
+
+  // req.body is a Buffer here because express.raw() is applied above
+  const rawBody = req.body;
+  if (!Buffer.isBuffer(rawBody) || rawBody.length === 0) {
+    console.warn("[webhook] Empty or non-buffer body");
+    return res.status(400).send("Empty body");
+  }
+
+  const expectedSignature = crypto
+    .createHmac("sha512", PAYSTACK_SECRET_KEY)
+    .update(rawBody)
+    .digest("hex");
+
+  if (expectedSignature !== signature) {
+    console.warn("[webhook] Signature mismatch — rejecting");
+    return res.status(400).send("Invalid signature");
+  }
+
+  // ── 2. Parse the verified payload ─────────────────────────
+  let event;
+  try {
+    event = JSON.parse(rawBody.toString("utf8"));
+  } catch (parseErr) {
+    console.error("[webhook] Failed to parse body:", parseErr.message);
+    return res.status(400).send("Invalid JSON");
+  }
+
+  const eventType = event.event || "";
+  console.log("[webhook] Received event=" + eventType);
+
+  // ── 3. Acknowledge immediately — Paystack expects 200 fast ─
+  // We send 200 now and process asynchronously so Paystack does
+  // not time out and retry unnecessarily.
+  res.status(200).send("OK");
+
+  // ── 4. Only process charge.success ─────────────────────────
+  if (eventType !== "charge.success") {
+    console.log("[webhook] Ignoring non-charge event: " + eventType);
+    return;
+  }
+
+  // ── 5. Extract transaction fields ─────────────────────────
+  const txData       = event.data || {};
+  const reference    = (txData.reference    || "").trim();
+  const txStatus     = (txData.status       || "").toLowerCase();
+  const amount       = Number(txData.amount)    || 0;
+  const currency     = (txData.currency     || "").toUpperCase();
+  const customerEmail = (txData.customer && txData.customer.email)
+    ? txData.customer.email : null;
+
+  console.log(
+    "[webhook] charge.success ref=" + reference +
+    " status=" + txStatus +
+    " amount=" + amount +
+    " currency=" + currency
+  );
+
+  if (!reference) {
+    console.warn("[webhook] No reference in payload — skipping");
+    return;
+  }
+
+  if (txStatus !== "success") {
+    console.warn("[webhook] Transaction status is not success: " + txStatus);
+    return;
+  }
+
+  // ── 6. Process asynchronously — errors must not propagate ──
+  (async () => {
+    try {
+      // ── 6a. Duplicate guard (fast pre-check before transaction) ──
+      const existingSnap = await db
+        .collection("coin_purchases")
+        .where("reference", "==", reference)
+        .limit(1)
+        .get();
+
+      if (!existingSnap.empty) {
+        console.log("[webhook] Already processed ref=" + reference + " — skipping");
+        return;
+      }
+
+      // ── 6b. Look up pending purchase ───────────────────────────
+      const pendingDocSnap = await db
+        .collection("pending_purchases")
+        .doc(reference)
+        .get();
+
+      if (!pendingDocSnap.exists) {
+        // The pending record may not exist yet if Flutter called
+        // the webhook reference before initialize-payment created it
+        // (e.g. user paid instantly). Wait briefly and retry once.
+        console.warn("[webhook] No pending_purchases doc for ref=" + reference +
+          " — retrying in 3s");
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+
+        const retrySnap = await db
+          .collection("pending_purchases")
+          .doc(reference)
+          .get();
+
+        if (!retrySnap.exists) {
+          console.error("[webhook] Still no pending record after retry for ref=" + reference);
+          return;
+        }
+      }
+
+      const pendingDocFinal = await db
+        .collection("pending_purchases")
+        .doc(reference)
+        .get();
+
+      if (!pendingDocFinal.exists) {
+        console.error("[webhook] No pending record for ref=" + reference + " — cannot credit");
+        return;
+      }
+
+      const pendingData = pendingDocFinal.data();
+      const uid         = pendingData.uid;
+
+      if (!uid) {
+        console.error("[webhook] No uid in pending record for ref=" + reference);
+        return;
+      }
+
+      // ── 6c. Validate package ────────────────────────────────────
+      const pkg = COIN_PACKAGES[pendingData.packageId];
+      if (!pkg) {
+        console.error("[webhook] Unknown packageId=" + pendingData.packageId +
+          " for ref=" + reference);
+        return;
+      }
+
+      // ── 6d. Validate amount and currency ────────────────────────
+      if (amount < pkg.koboAmount) {
+        console.warn(
+          "[webhook] Amount mismatch charged=" + amount +
+          " expected=" + pkg.koboAmount + " ref=" + reference
+        );
+        return;
+      }
+
+      if (currency !== pkg.currency.toUpperCase()) {
+        console.warn(
+          "[webhook] Currency mismatch charged=" + currency +
+          " expected=" + pkg.currency + " ref=" + reference
+        );
+        return;
+      }
+
+      // ── 6e. Credit coins atomically ─────────────────────────────
+      const pkgWithMeta = Object.assign({}, pkg, {
+        amountCharged:   amount,
+        chargedCurrency: currency,
+        source:          "webhook",
+      });
+
+      let creditResult;
+      try {
+        creditResult = await creditCoinsForReference(
+          reference, uid, pkgWithMeta, customerEmail
+        );
+      } catch (creditErr) {
+        if (creditErr.message === "ALREADY_CREDITED") {
+          console.log("[webhook] Race-condition duplicate blocked for ref=" + reference);
+          return;
+        }
+        throw creditErr;
+      }
+
+      const { newCoinBalance, isFirstPurchase } = creditResult;
+
+      console.log(
+        "[webhook] Coins credited uid=" + uid +
+        " coins+" + pkg.coins +
+        " newBalance=" + newCoinBalance +
+        " ref=" + reference
+      );
+
+      // ── 6f. In-app + push notification ──────────────────────────
+      notifyCoinPurchase(uid, pkg.coins, newCoinBalance, pkg.label)
+        .catch((e) => console.error("[webhook] notify error:", e.message));
+
+      // ── 6g. Referral reward (first purchase only) ───────────────
+      if (isFirstPurchase) {
+        tryGrantReferralReward(uid).catch((e) =>
+          console.error("[webhook] referral grant error:", e.message)
+        );
+      }
+
+    } catch (err) {
+      console.error("[webhook] Processing error for ref=" + reference + ":", err.message);
+    }
+  })();
+});
+
+// =============================================================
+// STORE — INITIALIZE PAYMENT
 // =============================================================
 app.post("/store/initialize-payment", verifyToken, async (req, res) => {
   const { packageId, email } = req.body;
@@ -1208,9 +1515,10 @@ app.post("/store/initialize-payment", verifyToken, async (req, res) => {
     return res.status(400).json({ error: "Unknown package: " + safePackageId });
   }
 
-  // Generate unique reference: duelix_uid_timestamp_random
-  const reference = "duelix_" + uid.substring(0, 8) + "_" +
-    Date.now() + "_" + Math.random().toString(36).substring(2, 8);
+  const reference =
+    "duelix_" + uid.substring(0, 8) + "_" +
+    Date.now() + "_" +
+    Math.random().toString(36).substring(2, 8);
 
   try {
     const paystackData = await initializePaystackTransaction(
@@ -1221,8 +1529,18 @@ app.post("/store/initialize-payment", verifyToken, async (req, res) => {
       { uid, packageId: safePackageId, packageLabel: pkg.label, coins: pkg.coins }
     );
 
-    // Store pending transaction so we can validate reference on verify
-    const pendingRef = db.collection("pending_purchases").doc(reference);
+    const authUrl     = paystackData.authorization_url || null;
+    const paystackRef = paystackData.reference         || reference;
+    const accessCode  = paystackData.access_code       || null;
+
+    if (!authUrl) {
+      console.error("[store/initialize] Paystack returned no authorization_url:", paystackData);
+      return res.status(502).json({
+        error: "Paystack did not return a payment URL. Please try again.",
+      });
+    }
+
+    const pendingRef = db.collection("pending_purchases").doc(paystackRef);
     await pendingRef.set({
       uid,
       packageId:    safePackageId,
@@ -1230,32 +1548,43 @@ app.post("/store/initialize-payment", verifyToken, async (req, res) => {
       coins:        pkg.coins,
       amountKobo:   pkg.koboAmount,
       currency:     pkg.currency,
-      reference,
+      reference:    paystackRef,
       status:       "pending",
       createdAt:    admin.firestore.FieldValue.serverTimestamp(),
     });
 
+    console.log(
+      "[store/initialize] uid=" + uid +
+      " pkg=" + safePackageId +
+      " ref=" + paystackRef +
+      " url=" + authUrl
+    );
+
     return res.json({
-      authorization_url: paystackData.authorization_url,
-      reference:         paystackData.reference || reference,
-      access_code:       paystackData.access_code || null,
+      authorization_url: authUrl,
+      authorizationUrl:  authUrl,
+      reference:         paystackRef,
+      access_code:       accessCode,
     });
+
   } catch (err) {
     console.error("[store/initialize] uid=" + uid + ":", err.message);
-    return res.status(502).json({ error: "Payment initialization failed: " + err.message });
+    return res.status(502).json({
+      error: "Payment initialization failed: " + err.message,
+    });
   }
 });
 
 // =============================================================
 // STORE — VERIFY PURCHASE
-// Step 2: After browser payment, Flutter calls this with reference.
-// Backend verifies with Paystack, credits coins atomically.
-// Duplicate references blocked (409).
-// Referral reward granted on first purchase only.
+// Flutter calls this after returning from the Paystack browser
+// page. If the webhook already ran, creditCoinsForReference()
+// returns ALREADY_CREDITED and we return the current balance
+// as a 409 (idempotent success for Flutter polling).
 // =============================================================
 app.post("/store/verify-purchase", verifyToken, async (req, res) => {
-  const { reference } = req.body;
   const uid = req.user.uid;
+  const { reference } = req.body;
 
   if (!reference || typeof reference !== "string" || !reference.trim()) {
     return res.status(400).json({ error: "reference is required" });
@@ -1263,20 +1592,23 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
 
   const safeRef = reference.trim();
 
+  console.log("[store/verify] start uid=" + uid + " ref=" + safeRef);
+
   try {
-    // Block duplicate processing
-    const existingPurchase = await db
+    // ── Duplicate guard (fast path — webhook may have already run) ─
+    const existingSnap = await db
       .collection("coin_purchases")
       .where("reference", "==", safeRef)
       .limit(1)
       .get();
 
-    if (!existingPurchase.empty) {
+    if (!existingSnap.empty) {
       const userDoc     = await db.collection("users").doc(uid).get();
       const coinBalance = userDoc.exists && userDoc.data().coins != null
         ? userDoc.data().coins : 0;
       const rcBalance   = userDoc.exists && userDoc.data().rcBalance != null
         ? userDoc.data().rcBalance : 0;
+      console.log("[store/verify] already processed (webhook ran first) ref=" + safeRef);
       return res.status(409).json({
         error:          "This payment has already been processed.",
         newCoinBalance: coinBalance,
@@ -1284,116 +1616,128 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
       });
     }
 
-    // Look up pending purchase to validate packageId server-side
-    const pendingDoc = await db.collection("pending_purchases").doc(safeRef).get();
-    if (!pendingDoc.exists) {
+    // ── Validate pending record ────────────────────────────────────
+    const pendingDocSnap = await db
+      .collection("pending_purchases")
+      .doc(safeRef)
+      .get();
+
+    if (!pendingDocSnap.exists) {
+      console.warn("[store/verify] no pending purchase found ref=" + safeRef);
       return res.status(400).json({
-        error: "No pending purchase found for this reference. Please initialize a purchase first.",
+        error: "No pending purchase found for this reference. " +
+               "Please initialize a purchase first.",
       });
     }
 
-    const pendingData = pendingDoc.data();
+    const pendingData = pendingDocSnap.data();
 
-    // Validate this reference belongs to this user
     if (pendingData.uid !== uid) {
-      return res.status(403).json({ error: "Reference does not belong to this account." });
+      console.warn("[store/verify] uid mismatch: token=" + uid +
+        " pending=" + pendingData.uid + " ref=" + safeRef);
+      return res.status(403).json({
+        error: "Reference does not belong to this account.",
+      });
     }
 
     const pkg = COIN_PACKAGES[pendingData.packageId];
     if (!pkg) {
-      return res.status(400).json({ error: "Unknown package in pending record." });
+      return res.status(400).json({
+        error: "Unknown package in pending record: " + pendingData.packageId,
+      });
     }
 
-    // Verify with Paystack
+    // ── Verify with Paystack ───────────────────────────────────────
     let paystackData;
     try {
       paystackData = await verifyPaystackTransaction(safeRef);
     } catch (verifyErr) {
+      console.error("[store/verify] Paystack call failed ref=" + safeRef + ":", verifyErr.message);
       return res.status(502).json({
         error: "Payment verification failed: " + verifyErr.message,
       });
     }
 
-    if (paystackData.status !== "success") {
+    console.log(
+      "[store/verify] Paystack txStatus=" + paystackData.status +
+      " amount="   + paystackData.amount +
+      " currency=" + paystackData.currency +
+      " ref="      + safeRef
+    );
+
+    if (!paystackData.status || paystackData.status !== "success") {
+      const txStatus = paystackData.status || "unknown";
+      console.warn("[store/verify] payment not success status=" + txStatus + " ref=" + safeRef);
       return res.status(400).json({
-        error: "Payment was not completed. Status: " + paystackData.status,
+        error: "Payment was not completed. Status: " + txStatus,
       });
     }
 
     const chargedAmount   = Number(paystackData.amount)   || 0;
-    const chargedCurrency = (paystackData.currency || "").toUpperCase();
+    const chargedCurrency = (paystackData.currency        || "").toUpperCase();
 
-    // Validate amount and currency match the package
     if (chargedAmount < pkg.koboAmount) {
       return res.status(400).json({
         error: "Payment amount does not match the selected package.",
       });
     }
+
     if (chargedCurrency !== pkg.currency.toUpperCase()) {
       return res.status(400).json({
         error: "Payment currency does not match the selected package.",
       });
     }
 
-    let newCoinBalance  = 0;
-    let newRcBalance    = 0;
-    let isFirstPurchase = false;
-
-    await db.runTransaction(async (t) => {
-      const userRef = db.collection("users").doc(uid);
-      const userDoc = await t.get(userRef);
-      if (!userDoc.exists) throw new Error("User not found");
-
-      const userData         = userDoc.data();
-      const currentCoins     = userData.coins     != null ? Number(userData.coins)     : 0;
-      const currentRc        = userData.rcBalance != null ? Number(userData.rcBalance) : 0;
-      const safeCurrentCoins = Math.max(0, currentCoins);
-      newCoinBalance         = safeCurrentCoins + pkg.coins;
-      newRcBalance           = currentRc;
-
-      isFirstPurchase = !userData.firstPurchaseDone;
-
-      t.update(userRef, {
-        coins:             newCoinBalance,
-        firstPurchaseDone: true,
-        updatedAt:         admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      const purchaseRef = db.collection("coin_purchases").doc();
-      t.set(purchaseRef, {
-        id:            purchaseRef.id,
-        userId:        uid,
-        packageId:     pendingData.packageId,
-        packageLabel:  pkg.label,
-        coinsAdded:    pkg.coins,
-        reference:     safeRef,
-        amountCharged: chargedAmount,
-        currency:      chargedCurrency,
-        status:        "completed",
-        paystackEmail: paystackData.customer && paystackData.customer.email
-          ? paystackData.customer.email : null,
-        createdAt:     admin.firestore.FieldValue.serverTimestamp(),
-      });
-
-      // Mark pending purchase as completed
-      const pendingRef = db.collection("pending_purchases").doc(safeRef);
-      t.update(pendingRef, {
-        status:      "completed",
-        completedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
+    // ── Credit coins (shared logic with webhook) ───────────────────
+    const pkgWithMeta = Object.assign({}, pkg, {
+      amountCharged:   chargedAmount,
+      chargedCurrency: chargedCurrency,
+      source:          "verify",
     });
 
-    // Grant referral reward only after first successful purchase
+    let creditResult;
+    try {
+      creditResult = await creditCoinsForReference(
+        safeRef,
+        uid,
+        pkgWithMeta,
+        (paystackData.customer && paystackData.customer.email)
+          ? paystackData.customer.email : null
+      );
+    } catch (creditErr) {
+      if (creditErr.message === "ALREADY_CREDITED") {
+        // Webhook raced and won — return current balance
+        const userDoc     = await db.collection("users").doc(uid).get();
+        const coinBalance = userDoc.exists && userDoc.data().coins != null
+          ? userDoc.data().coins : 0;
+        const rcBalance   = userDoc.exists && userDoc.data().rcBalance != null
+          ? userDoc.data().rcBalance : 0;
+        return res.status(409).json({
+          error:          "This payment has already been processed.",
+          newCoinBalance: coinBalance,
+          newRcBalance:   rcBalance,
+        });
+      }
+      throw creditErr;
+    }
+
+    const { newCoinBalance, newRcBalance, isFirstPurchase } = creditResult;
+
+    console.log(
+      "[store/verify] success uid=" + uid +
+      " coins+" + pkg.coins +
+      " newBalance=" + newCoinBalance +
+      " ref=" + safeRef
+    );
+
+    notifyCoinPurchase(uid, pkg.coins, newCoinBalance, pkg.label)
+      .catch((e) => console.error("[store/verify] notify error:", e.message));
+
     if (isFirstPurchase) {
       tryGrantReferralReward(uid).catch((e) =>
         console.error("[store/verify] referral grant error:", e.message)
       );
     }
-
-    notifyCoinPurchase(uid, pkg.coins, newCoinBalance, pkg.label)
-      .catch((e) => console.error("[store/verify] notify error:", e.message));
-
-    console.log("[store/verify] uid=" + uid + " coins+" + pkg.coins + " ref=" + safeRef);
 
     return res.json({
       message:        "Purchase verified and coins credited",
@@ -1403,7 +1747,7 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     });
 
   } catch (err) {
-    console.error("[store/verify] fatal uid=" + uid + ":", err.message);
+    console.error("[store/verify] fatal uid=" + uid + " ref=" + safeRef + ":", err.message);
     return res.status(500).json({ error: err.message });
   }
 });
@@ -1424,7 +1768,6 @@ app.get("/rc/balance/:uid", verifyToken, async (req, res) => {
 
 // =============================================================
 // RC REDEEM
-// Min 200 RC. Must be multiple of 100. Cannot exceed balance.
 // =============================================================
 app.post("/rc/redeem", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1496,7 +1839,8 @@ app.post("/rc/redeem", verifyToken, async (req, res) => {
 
     notifyUser(
       uid, "redeem_successful", "Redemption Request Submitted",
-      "Your request to redeem " + rcAmount + " RC ($" + usdValue.toFixed(2) + ") has been received. Allow 1-3 business days.",
+      "Your request to redeem " + rcAmount + " RC ($" + usdValue.toFixed(2) +
+        ") has been received. Allow 1-3 business days.",
       { rcAmount, usdValue }
     ).catch(() => {});
 
@@ -1588,7 +1932,10 @@ app.post("/trust/update", verifyToken, async (req, res) => {
       trustUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    return res.json({ message: "Trust score updated", trustScore: computeTrustScore(data) });
+    return res.json({
+      message:    "Trust score updated",
+      trustScore: computeTrustScore(data),
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -1656,8 +2003,6 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // CREATE USER PROFILE
-// Signup bonus: 20 coins.
-// bonusMatchUsed: false — first match earns no RC.
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1667,11 +2012,15 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     return res.status(400).json({ error: "displayName and phone are required" });
   }
   if (!/^\+\d{7,15}$/.test(phone)) {
-    return res.status(400).json({ error: "phone must be in E.164 format (e.g. +233244123456)" });
+    return res.status(400).json({
+      error: "phone must be in E.164 format (e.g. +233244123456)",
+    });
   }
   const name = displayName.trim();
   if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) {
-    return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
+    return res.status(400).json({
+      error: "displayName: 3-20 chars, letters/numbers/underscores/dots only",
+    });
   }
 
   const ipAddress = req.headers["x-forwarded-for"]
@@ -1689,17 +2038,21 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     if (deviceCount >= 3) {
       console.warn("[create-profile] Suspicious device: deviceId=" + deviceId +
         " installId=" + installId + " existingAccounts=" + deviceCount);
-      detectSuspiciousActivity(uid, "multi_account_device count=" + deviceCount).catch(() => {});
+      detectSuspiciousActivity(
+        uid, "multi_account_device count=" + deviceCount
+      ).catch(() => {});
     }
 
     const userRef      = db.collection("users").doc(uid);
     const referralCode = await uniqueReferralCode();
 
-    const phoneSnap = await db.collection("users").where("phone", "==", phone).limit(1).get();
+    const phoneSnap = await db.collection("users")
+      .where("phone", "==", phone).limit(1).get();
     if (!phoneSnap.empty && phoneSnap.docs[0].id !== uid) {
       return res.status(409).json({ error: "That phone number is already registered" });
     }
-    const nameSnap = await db.collection("users").where("displayName", "==", name).limit(1).get();
+    const nameSnap = await db.collection("users")
+      .where("displayName", "==", name).limit(1).get();
     if (!nameSnap.empty && nameSnap.docs[0].id !== uid) {
       return res.status(409).json({ error: "That username is already taken" });
     }
@@ -1737,7 +2090,8 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
 
-    notifyUser(uid, "system", "Welcome to Duelix!",
+    notifyUser(
+      uid, "system", "Welcome to Duelix!",
       "Your account is ready. You have been given 20 coins to start. Good luck!", {}
     ).catch(() => {});
 
@@ -1758,8 +2112,6 @@ app.get("/user-exists/:uid", async (req, res) => {
 
 // =============================================================
 // REFERRAL SYSTEM
-// apply-referral stores the referral link on signup.
-// Coin reward fires only after first purchase.
 // =============================================================
 app.post("/apply-referral", verifyToken, async (req, res) => {
   const currentUid       = req.user.uid;
@@ -1775,7 +2127,9 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
     const codeSnap = await db
       .collection("users").where("referralCode", "==", code).limit(1).get();
 
-    if (codeSnap.empty) return res.status(404).json({ error: "Referral code not found" });
+    if (codeSnap.empty) {
+      return res.status(404).json({ error: "Referral code not found" });
+    }
 
     const referrerUid  = codeSnap.docs[0].id;
     const referrerData = codeSnap.docs[0].data();
@@ -1800,8 +2154,10 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
       const referrerDoc = await t.get(referrerRef);
       if (referrerDoc.exists) {
         t.update(referrerRef, {
-          referralCount: inc(referrerDoc.data().referralCount != null
-            ? referrerDoc.data().referralCount : 0),
+          referralCount: inc(
+            referrerDoc.data().referralCount != null
+              ? referrerDoc.data().referralCount : 0
+          ),
         });
       }
     });
@@ -1831,22 +2187,22 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     if (data.trustScore === undefined) {
       const trustFields = {
         trustScore:            80,
-        completedMatches:      data.completedMatches     != null ? data.completedMatches     : 0,
-        cancelledMatches:      data.cancelledMatches     != null ? data.cancelledMatches     : 0,
-        disputesLost:          data.disputesLost         != null ? data.disputesLost         : 0,
-        reportsReceived:       data.reportsReceived      != null ? data.reportsReceived      : 0,
-        fakeResults:           data.fakeResults          != null ? data.fakeResults          : 0,
-        rageQuits:             data.rageQuits            != null ? data.rageQuits            : 0,
+        completedMatches:      data.completedMatches      != null ? data.completedMatches      : 0,
+        cancelledMatches:      data.cancelledMatches      != null ? data.cancelledMatches      : 0,
+        disputesLost:          data.disputesLost          != null ? data.disputesLost          : 0,
+        reportsReceived:       data.reportsReceived       != null ? data.reportsReceived       : 0,
+        fakeResults:           data.fakeResults           != null ? data.fakeResults           : 0,
+        rageQuits:             data.rageQuits             != null ? data.rageQuits             : 0,
         fairPlayRating:        100,
         matchCompletionRate:   0,
         cleanMatchBonus:       0,
         fairPlayBonus:         0,
-        rcBalance:             data.rcBalance            != null ? data.rcBalance            : 0,
-        bonusMatchUsed:        data.bonusMatchUsed       != null ? data.bonusMatchUsed       : false,
-        firstPurchaseDone:     data.firstPurchaseDone    != null ? data.firstPurchaseDone    : false,
+        rcBalance:             data.rcBalance             != null ? data.rcBalance             : 0,
+        bonusMatchUsed:        data.bonusMatchUsed        != null ? data.bonusMatchUsed        : false,
+        firstPurchaseDone:     data.firstPurchaseDone     != null ? data.firstPurchaseDone     : false,
         referralRewardGranted: data.referralRewardGranted != null ? data.referralRewardGranted : false,
-        onlineStatus:          data.onlineStatus         != null ? data.onlineStatus         : true,
-        friendRequests:        data.friendRequests       != null ? data.friendRequests       : true,
+        onlineStatus:          data.onlineStatus          != null ? data.onlineStatus          : true,
+        friendRequests:        data.friendRequests        != null ? data.friendRequests        : true,
       };
       db.collection("users").doc(req.params.uid)
         .set(trustFields, { merge: true })
@@ -1889,11 +2245,14 @@ app.post("/update-name", verifyToken, async (req, res) => {
 
   const name = displayName.trim();
   if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) {
-    return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
+    return res.status(400).json({
+      error: "displayName: 3-20 chars, letters/numbers/underscores/dots only",
+    });
   }
 
   try {
-    const snap = await db.collection("users").where("displayName", "==", name).limit(1).get();
+    const snap = await db.collection("users")
+      .where("displayName", "==", name).limit(1).get();
     if (!snap.empty && snap.docs[0].id !== req.user.uid) {
       return res.status(409).json({ error: "That username is already taken" });
     }
@@ -1965,8 +2324,9 @@ app.post("/add-coins", verifyToken, async (req, res) => {
 
 app.post("/reset-account", verifyToken, async (req, res) => {
   const { coins }  = req.body;
-  const resetCoins = (coins != null && Number.isInteger(coins) && coins >= 0 && coins <= 100000)
-    ? coins : 20;
+  const resetCoins =
+    (coins != null && Number.isInteger(coins) && coins >= 0 && coins <= 100000)
+      ? coins : 20;
   try {
     await db.collection("users").doc(req.user.uid).update({
       coins: resetCoins, wins: 0, losses: 0, draws: 0, totalMatches: 0,
@@ -2035,8 +2395,10 @@ app.post("/matches/create", verifyToken, async (req, res) => {
 app.get("/matches", verifyToken, async (req, res) => {
   try {
     const [waitingSnap, activeSnap] = await Promise.all([
-      db.collection("matches").where("status", "==", "waiting").orderBy("createdAt", "desc").get(),
-      db.collection("matches").where("status", "==", "active").orderBy("startedAt", "desc").get(),
+      db.collection("matches").where("status", "==", "waiting")
+        .orderBy("createdAt", "desc").get(),
+      db.collection("matches").where("status", "==", "active")
+        .orderBy("startedAt", "desc").get(),
     ]);
     const matches = [
       ...waitingSnap.docs.map((d) => d.data()),
@@ -2058,7 +2420,9 @@ app.post("/matches/join", verifyToken, async (req, res) => {
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
-      const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
+      const [matchDoc, userDoc] = await Promise.all([
+        t.get(matchRef), t.get(userRef),
+      ]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
       if (!userDoc.exists)  throw new Error("User not found");
@@ -2103,7 +2467,9 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
-      const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
+      const [matchDoc, userDoc] = await Promise.all([
+        t.get(matchRef), t.get(userRef),
+      ]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
       if (!userDoc.exists)  throw new Error("User not found");
@@ -2116,7 +2482,8 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
       entryFeeRefunded = match.entryFee;
       t.update(userRef,  { coins: inc(userDoc.data().coins, match.entryFee) });
       t.update(matchRef, {
-        status: "cancelled", cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+        status: "cancelled",
+        cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
 
@@ -2143,9 +2510,13 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
     let matchId = null, didCreate = false, playerAUid = null;
 
     const candidateSnap = await db.collection("matches")
-      .where("status", "==", "waiting").where("game", "==", gameUpper)
-      .where("entryFee", "==", entryFee).where("isPrivate", "==", false)
-      .orderBy("createdAt", "asc").limit(10).get();
+      .where("status",    "==", "waiting")
+      .where("game",      "==", gameUpper)
+      .where("entryFee",  "==", entryFee)
+      .where("isPrivate", "==", false)
+      .orderBy("createdAt", "asc")
+      .limit(10)
+      .get();
 
     const candidates = candidateSnap.docs.filter((doc) => {
       const d = doc.data();
@@ -2157,7 +2528,9 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
       await db.runTransaction(async (t) => {
         const matchRef = db.collection("matches").doc(matchId);
         const userRef  = db.collection("users").doc(uid);
-        const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
+        const [matchDoc, userDoc] = await Promise.all([
+          t.get(matchRef), t.get(userRef),
+        ]);
 
         if (!matchDoc.exists) throw new Error("Match no longer exists");
         if (!userDoc.exists)  throw new Error("User not found");
@@ -2180,7 +2553,9 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
         });
       });
 
-      if (playerAUid) notifyMatchJoined(playerAUid, uid, matchId, gameUpper).catch(() => {});
+      if (playerAUid) {
+        notifyMatchJoined(playerAUid, uid, matchId, gameUpper).catch(() => {});
+      }
 
     } else {
       didCreate = true;
@@ -2227,7 +2602,9 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
   const uid = req.user.uid;
 
   if (!matchId || myScore === undefined || opponentScore === undefined) {
-    return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
+    return res.status(400).json({
+      error: "matchId, myScore, opponentScore required",
+    });
   }
   try {
     validateScore(myScore, "myScore");
@@ -2244,7 +2621,9 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
       if (!matchDoc.exists) throw new Error("Match not found");
 
       const match = matchDoc.data();
-      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
+      if (match.playerA !== uid && match.playerB !== uid) {
+        throw new Error("You are not in this match");
+      }
       if (match.status !== "active")  throw new Error("Match is not active");
       if (hasSubmittedResult(match))  throw new Error("Result already submitted");
 
@@ -2260,7 +2639,9 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
     });
 
     if (opponentUid) notifyResultSubmitted(opponentUid, matchId).catch(() => {});
-    return res.json({ message: "Result submitted -- waiting for opponent to confirm" });
+    return res.json({
+      message: "Result submitted -- waiting for opponent to confirm",
+    });
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -2281,7 +2662,9 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       const match = matchDoc.data();
       matchSnapshot = match;
-      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
+      if (match.playerA !== uid && match.playerB !== uid) {
+        throw new Error("You are not in this match");
+      }
       if (match.status === "completed") throw new Error("Match already completed");
       if (match.status !== "active")    throw new Error("Match is not active");
       if (!hasSubmittedResult(match))   throw new Error("No result submitted yet");
@@ -2289,7 +2672,8 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       const submitter      = match.submittedBy;
       const confirmer      = uid;
-      const scoreOf        = match.result && match.result.scoreOf ? match.result.scoreOf : {};
+      const scoreOf        = match.result && match.result.scoreOf
+        ? match.result.scoreOf : {};
       const submitterScore = scoreOf[submitter] != null ? scoreOf[submitter] : 0;
       const confirmerScore = scoreOf[confirmer] != null ? scoreOf[confirmer] : 0;
 
@@ -2304,16 +2688,24 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
     if (matchSnapshot) {
       const w = result.confirmedWinner;
       if (w === "draw") {
-        notifyMatchDraw(matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
-        notifyMatchDraw(matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
+        notifyMatchDraw(
+          matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)
+        ).catch(() => {});
+        notifyMatchDraw(
+          matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)
+        ).catch(() => {});
       } else {
-        const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
+        const loserUid = w === matchSnapshot.playerA
+          ? matchSnapshot.playerB : matchSnapshot.playerA;
         notifyMatchWon(w,         matchId, result.winner).catch(() => {});
         notifyMatchLost(loserUid, matchId, result.loser).catch(() => {});
       }
     }
 
-    return res.json({ message: "Result confirmed", confirmedWinner: result.confirmedWinner });
+    return res.json({
+      message:         "Result confirmed",
+      confirmedWinner: result.confirmedWinner,
+    });
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -2338,7 +2730,9 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
   let validatedEvidence = "";
   if (evidenceImage) {
     if (typeof evidenceImage !== "string" || evidenceImage.length > 2000) {
-      return res.status(400).json({ error: "evidenceImage must be a valid URL string" });
+      return res.status(400).json({
+        error: "evidenceImage must be a valid URL string",
+      });
     }
     validatedEvidence = evidenceImage.trim();
   }
@@ -2369,8 +2763,10 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
         reportedBy: uid, disputedBy: uid, status: "pending",
         resolvedBy: null, resolvedAt: null, resolutionNote: null,
         matchData: {
-          playerA: match.playerA, playerB: match.playerB,
-          game: match.game, entryFee: match.entryFee,
+          playerA:     match.playerA,
+          playerB:     match.playerB,
+          game:        match.game,
+          entryFee:    match.entryFee,
           submittedBy: match.submittedBy != null ? match.submittedBy : null,
           result:      match.result      != null ? match.result      : null,
         },
@@ -2378,7 +2774,10 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       });
 
       t.update(matchRef, {
-        status: "disputed", disputedAt: now, disputedBy: uid, disputeId,
+        status:     "disputed",
+        disputedAt: now,
+        disputedBy: uid,
+        disputeId,
       });
     });
 
@@ -2387,11 +2786,21 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
 
     return res.json({ message: "Dispute submitted -- under review", disputeId });
   } catch (err) {
-    if (err.message === "NOT_IN_MATCH")      return res.status(403).json({ error: "You are not in this match" });
-    if (err.message === "ALREADY_DISPUTED")  return res.status(409).json({ error: "This match has already been disputed" });
-    if (err.message === "ALREADY_COMPLETED") return res.status(400).json({ error: "Match is already completed -- cannot dispute" });
-    if (err.message === "ALREADY_CANCELLED") return res.status(400).json({ error: "Match is cancelled -- cannot dispute" });
-    if (err.message === "Match not found")   return res.status(404).json({ error: "Match not found" });
+    if (err.message === "NOT_IN_MATCH") {
+      return res.status(403).json({ error: "You are not in this match" });
+    }
+    if (err.message === "ALREADY_DISPUTED") {
+      return res.status(409).json({ error: "This match has already been disputed" });
+    }
+    if (err.message === "ALREADY_COMPLETED") {
+      return res.status(400).json({ error: "Match is already completed -- cannot dispute" });
+    }
+    if (err.message === "ALREADY_CANCELLED") {
+      return res.status(400).json({ error: "Match is cancelled -- cannot dispute" });
+    }
+    if (err.message === "Match not found") {
+      return res.status(404).json({ error: "Match not found" });
+    }
     return res.status(500).json({ error: err.message });
   }
 });
@@ -2438,18 +2847,24 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
         result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true };
         return;
       }
-      if (match.status === "cancelled") { result = { alreadyCancelled: true }; return; }
+      if (match.status === "cancelled") {
+        result = { alreadyCancelled: true }; return;
+      }
       if (match.status !== "active") {
-        throw new Error("Cannot auto-resolve -- status is \"" + match.status + "\"");
+        throw new Error(
+          "Cannot auto-resolve -- status is \"" + match.status + "\""
+        );
       }
       if (!hasSubmittedResult(match)) {
         throw new Error("No result submitted -- use auto-cancel");
       }
 
       matchSnapshot = match;
-      const scoreOf        = match.result && match.result.scoreOf ? match.result.scoreOf : {};
+      const scoreOf        = match.result && match.result.scoreOf
+        ? match.result.scoreOf : {};
       const submitter      = match.submittedBy;
-      const other          = submitter === match.playerA ? match.playerB : match.playerA;
+      const other          = submitter === match.playerA
+        ? match.playerB : match.playerA;
       const submitterScore = scoreOf[submitter] != null ? scoreOf[submitter] : 0;
       const otherScore     = scoreOf[other]     != null ? scoreOf[other]     : 0;
 
@@ -2468,7 +2883,9 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
         applyTrustUpdate(t, nonSubmitterRef, nsData);
       }
 
-      result = await distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, other);
+      result = await distributeRewardAutoResolve(
+        t, match, matchRef, confirmedWinner, other
+      );
       t.update(matchRef, { autoResolved: true });
     });
 
@@ -2478,18 +2895,33 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       notifyAutoResolved(matchSnapshot.playerB, matchId, w).catch(() => {});
 
       if (w === "draw") {
-        notifyMatchDraw(matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
-        notifyMatchDraw(matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)).catch(() => {});
+        notifyMatchDraw(
+          matchSnapshot.playerA, matchId, drawRefund(matchSnapshot.entryFee)
+        ).catch(() => {});
+        notifyMatchDraw(
+          matchSnapshot.playerB, matchId, drawRefund(matchSnapshot.entryFee)
+        ).catch(() => {});
       } else {
-        const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
+        const loserUid = w === matchSnapshot.playerA
+          ? matchSnapshot.playerB : matchSnapshot.playerA;
         notifyMatchWon(w,         matchId, result.winner).catch(() => {});
         notifyMatchLost(loserUid, matchId, result.loser).catch(() => {});
       }
     }
 
-    if (result.alreadyResolved)  return res.json({ message: "Already resolved", confirmedWinner: result.confirmedWinner });
-    if (result.alreadyCancelled) return res.json({ message: "Already cancelled" });
-    return res.json({ message: "Auto-resolved", confirmedWinner: result.confirmedWinner });
+    if (result.alreadyResolved) {
+      return res.json({
+        message:         "Already resolved",
+        confirmedWinner: result.confirmedWinner,
+      });
+    }
+    if (result.alreadyCancelled) {
+      return res.json({ message: "Already cancelled" });
+    }
+    return res.json({
+      message:         "Auto-resolved",
+      confirmedWinner: result.confirmedWinner,
+    });
   } catch (err) {
     return res.status(400).json({ error: err.message });
   }
@@ -2512,9 +2944,13 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
         alreadyDone = true; return;
       }
       if (match.status !== "active") {
-        throw new Error("Cannot auto-cancel -- status is \"" + match.status + "\"");
+        throw new Error(
+          "Cannot auto-cancel -- status is \"" + match.status + "\""
+        );
       }
-      if (hasSubmittedResult(match)) throw new Error("Result submitted -- use auto-resolve");
+      if (hasSubmittedResult(match)) {
+        throw new Error("Result submitted -- use auto-resolve");
+      }
 
       matchSnapshot = match;
       const playerA_Ref = db.collection("users").doc(match.playerA);
@@ -2522,7 +2958,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const [playerA_Doc, playerB_Doc] = await Promise.all([
         t.get(playerA_Ref), t.get(playerB_Ref),
       ]);
-      if (!playerA_Doc.exists || !playerB_Doc.exists) throw new Error("Player data not found");
+      if (!playerA_Doc.exists || !playerB_Doc.exists) {
+        throw new Error("Player data not found");
+      }
 
       const playerA_Data = playerA_Doc.data();
       const playerB_Data = playerB_Doc.data();
@@ -2530,8 +2968,12 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       t.update(playerA_Ref, { coins: inc(playerA_Data.coins, match.entryFee) });
       t.update(playerB_Ref, { coins: inc(playerB_Data.coins, match.entryFee) });
 
-      const aUpdated = Object.assign({}, playerA_Data, { rageQuits: inc(playerA_Data.rageQuits) });
-      const bUpdated = Object.assign({}, playerB_Data, { rageQuits: inc(playerB_Data.rageQuits) });
+      const aUpdated = Object.assign({}, playerA_Data, {
+        rageQuits: inc(playerA_Data.rageQuits),
+      });
+      const bUpdated = Object.assign({}, playerB_Data, {
+        rageQuits: inc(playerB_Data.rageQuits),
+      });
       t.update(playerA_Ref, { rageQuits: inc(playerA_Data.rageQuits) });
       t.update(playerB_Ref, { rageQuits: inc(playerB_Data.rageQuits) });
       applyTrustUpdate(t, playerA_Ref, aUpdated);
@@ -2546,8 +2988,12 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
     });
 
     if (!alreadyDone && matchSnapshot) {
-      notifyAutoCancelled(matchSnapshot.playerA, matchId, matchSnapshot.entryFee).catch(() => {});
-      notifyAutoCancelled(matchSnapshot.playerB, matchId, matchSnapshot.entryFee).catch(() => {});
+      notifyAutoCancelled(
+        matchSnapshot.playerA, matchId, matchSnapshot.entryFee
+      ).catch(() => {});
+      notifyAutoCancelled(
+        matchSnapshot.playerB, matchId, matchSnapshot.entryFee
+      ).catch(() => {});
     }
 
     if (alreadyDone) return res.json({ message: "No action needed" });
@@ -2567,7 +3013,9 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
-      const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
+      const [matchDoc, userDoc] = await Promise.all([
+        t.get(matchRef), t.get(userRef),
+      ]);
 
       if (!matchDoc.exists) throw new Error("Match not found");
       if (!userDoc.exists)  throw new Error("User not found");
@@ -2575,14 +3023,17 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
       const match     = matchDoc.data();
       const userCoins = userDoc.data().coins != null ? userDoc.data().coins : 0;
 
-      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
+      if (match.playerA !== uid && match.playerB !== uid) {
+        throw new Error("You are not in this match");
+      }
       if (match.status !== "completed") throw new Error("Match not completed");
       if (match.rematchRequestedBy)     throw new Error("Rematch already requested");
       if (userCoins < match.entryFee)   throw new Error("Insufficient coins for rematch");
 
       opponentUid = match.playerA === uid ? match.playerB : match.playerA;
       t.update(matchRef, {
-        rematchRequestedBy: uid, rematchStatus: "pending",
+        rematchRequestedBy: uid,
+        rematchStatus:      "pending",
         rematchRequestedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
     });
@@ -2612,7 +3063,9 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         rematchDeclinedAt: admin.firestore.FieldValue.serverTimestamp(),
       });
 
-      if (rematchRequester) notifyRematchDeclined(rematchRequester, matchId).catch(() => {});
+      if (rematchRequester) {
+        notifyRematchDeclined(rematchRequester, matchId).catch(() => {});
+      }
       return res.json({ message: "Rematch declined" });
     } catch (err) {
       return res.status(500).json({ error: err.message });
@@ -2628,9 +3081,11 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
       if (!matchDoc.exists) throw new Error("Match not found");
 
       const match = matchDoc.data();
-      if (match.playerA !== uid && match.playerB !== uid) throw new Error("You are not in this match");
-      if (match.rematchStatus !== "pending")  throw new Error("No pending rematch");
-      if (match.rematchRequestedBy === uid)   throw new Error("Cannot accept own rematch request");
+      if (match.playerA !== uid && match.playerB !== uid) {
+        throw new Error("You are not in this match");
+      }
+      if (match.rematchStatus !== "pending") throw new Error("No pending rematch");
+      if (match.rematchRequestedBy === uid)  throw new Error("Cannot accept own rematch request");
 
       playerAUid = match.playerA;
       playerBUid = match.playerB;
@@ -2641,8 +3096,10 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         t.get(playerA_Ref), t.get(playerB_Ref),
       ]);
 
-      const coinsA = playerA_Doc.exists && playerA_Doc.data().coins != null ? playerA_Doc.data().coins : 0;
-      const coinsB = playerB_Doc.exists && playerB_Doc.data().coins != null ? playerB_Doc.data().coins : 0;
+      const coinsA = playerA_Doc.exists && playerA_Doc.data().coins != null
+        ? playerA_Doc.data().coins : 0;
+      const coinsB = playerB_Doc.exists && playerB_Doc.data().coins != null
+        ? playerB_Doc.data().coins : 0;
       if (coinsA < match.entryFee) throw new Error("Player A insufficient coins");
       if (coinsB < match.entryFee) throw new Error("Player B insufficient coins");
 
@@ -2700,10 +3157,13 @@ app.post("/matches/chat/send", verifyToken, async (req, res) => {
     const chatRef = db.collection("matches").doc(matchId).collection("chat").doc();
     await chatRef.set({
       id: chatRef.id, matchId, senderId: uid, senderName,
-      message: safeText, createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      message: safeText,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
-    if (recipientUid) notifyChatMessage(recipientUid, senderName, matchId, safeText).catch(() => {});
+    if (recipientUid) {
+      notifyChatMessage(recipientUid, senderName, matchId, safeText).catch(() => {});
+    }
     return res.status(201).json({ message: "Message sent", messageId: chatRef.id });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -2727,8 +3187,8 @@ app.get("/matches/chat/:matchId", verifyToken, async (req, res) => {
       return res.status(403).json({ error: "You are not in this match" });
     }
 
-    const chatSnap = await db.collection("matches").doc(matchId).collection("chat")
-      .orderBy("createdAt", "asc").limit(50).get();
+    const chatSnap = await db.collection("matches").doc(matchId)
+      .collection("chat").orderBy("createdAt", "asc").limit(50).get();
     return res.json(chatSnap.docs.map((d) => d.data()));
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -2740,7 +3200,9 @@ app.post("/report", verifyToken, async (req, res) => {
   const reporterUid = req.user.uid;
 
   if (!reportedUid || !description) {
-    return res.status(400).json({ error: "reportedUid and description required" });
+    return res.status(400).json({
+      error: "reportedUid and description required",
+    });
   }
   if (reportedUid === reporterUid) {
     return res.status(400).json({ error: "You cannot report yourself" });
@@ -2758,7 +3220,9 @@ app.post("/report", verifyToken, async (req, res) => {
     db.collection("users").doc(reportedUid).get().then((doc) => {
       if (!doc.exists) return;
       const data    = doc.data();
-      const updated = Object.assign({}, data, { reportsReceived: inc(data.reportsReceived) });
+      const updated = Object.assign({}, data, {
+        reportsReceived: inc(data.reportsReceived),
+      });
       doc.ref.update({ reportsReceived: inc(data.reportsReceived) }).catch(() => {});
       doc.ref.set({
         trustScore:          computeTrustScore(updated),
@@ -2776,7 +3240,8 @@ app.post("/report", verifyToken, async (req, res) => {
 
 app.get("/leaderboard", verifyToken, async (req, res) => {
   try {
-    const snap = await db.collection("users").orderBy("wins", "desc").limit(20).get();
+    const snap = await db.collection("users")
+      .orderBy("wins", "desc").limit(20).get();
     const leaderboard = snap.docs.map((doc, i) => {
       const d = doc.data();
       return {
@@ -2803,7 +3268,9 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
     let lastDoc = null, hasMore = true;
 
     while (hasMore) {
-      const snap = lastDoc ? await query.startAfter(lastDoc).get() : await query.get();
+      const snap = lastDoc
+        ? await query.startAfter(lastDoc).get()
+        : await query.get();
       if (snap.empty) { hasMore = false; break; }
 
       const batch = db.batch();
@@ -2840,17 +3307,23 @@ app.post("/matches/timer-alert", verifyToken, async (req, res) => {
   if (!matchId) return res.status(400).json({ error: "matchId is required" });
   const validAlerts = ["5min", "1min", "expired"];
   if (!alertType || !validAlerts.includes(alertType)) {
-    return res.status(400).json({ error: "alertType must be 5min, 1min, or expired" });
+    return res.status(400).json({
+      error: "alertType must be 5min, 1min, or expired",
+    });
   }
 
   try {
     const matchDoc = await db.collection("matches").doc(matchId).get();
     if (!matchDoc.exists) return res.status(404).json({ error: "Match not found" });
     const match = matchDoc.data();
-    if (match.status !== "active") return res.json({ message: "Match not active -- no alert sent" });
+    if (match.status !== "active") {
+      return res.json({ message: "Match not active -- no alert sent" });
+    }
 
     const uids = [match.playerA, match.playerB].filter(Boolean);
-    await Promise.all(uids.map((uid) => notifyRoomTimer(uid, matchId, alertType).catch(() => {})));
+    await Promise.all(
+      uids.map((uid) => notifyRoomTimer(uid, matchId, alertType).catch(() => {}))
+    );
     return res.json({ message: "Timer alert sent", alertType, matchId });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -2863,22 +3336,33 @@ app.post("/notifications/trigger", verifyToken, async (req, res) => {
   if (!userId || typeof userId !== "string" || !userId.trim()) {
     return res.status(400).json({ error: "userId is required" });
   }
-  if (!type    || typeof type    !== "string" || !type.trim())    return res.status(400).json({ error: "type is required" });
-  if (!title   || typeof title   !== "string" || !title.trim())   return res.status(400).json({ error: "title is required" });
-  if (!message || typeof message !== "string") return res.status(400).json({ error: "message is required" });
+  if (!type    || typeof type    !== "string" || !type.trim()) {
+    return res.status(400).json({ error: "type is required" });
+  }
+  if (!title   || typeof title   !== "string" || !title.trim()) {
+    return res.status(400).json({ error: "title is required" });
+  }
+  if (!message || typeof message !== "string") {
+    return res.status(400).json({ error: "message is required" });
+  }
 
-  const safeMeta      = (meta && typeof meta === "object" && !Array.isArray(meta)) ? meta : {};
+  const safeMeta      = (meta && typeof meta === "object" && !Array.isArray(meta))
+    ? meta : {};
   const pushOnlyTypes = ["chat_message", "room_timer"];
   const isPushOnly    = pushOnlyTypes.includes(type.trim());
 
   try {
-    if (!isPushOnly) await createNotification(userId, type, title, message, safeMeta);
+    if (!isPushOnly) {
+      await createNotification(userId, type, title, message, safeMeta);
+    }
 
     const userDoc = await db.collection("users").doc(userId).get();
     if (userDoc.exists) {
       const userData = userDoc.data();
       if (userData.notificationsEnabled === true && userData.fcmToken) {
-        await sendPushNotification(userId, title, message, Object.assign({}, safeMeta, { type }));
+        await sendPushNotification(
+          userId, title, message, Object.assign({}, safeMeta, { type })
+        );
       }
     }
 
@@ -2892,7 +3376,10 @@ app.post("/update-notification-prefs", verifyToken, async (req, res) => {
   const uid = req.user.uid;
   const { notificationPromptShown, notificationsEnabled } = req.body;
 
-  if (typeof notificationPromptShown !== "boolean" || typeof notificationsEnabled !== "boolean") {
+  if (
+    typeof notificationPromptShown !== "boolean" ||
+    typeof notificationsEnabled    !== "boolean"
+  ) {
     return res.status(400).json({ error: "Both fields must be boolean" });
   }
 
@@ -2902,7 +3389,9 @@ app.post("/update-notification-prefs", verifyToken, async (req, res) => {
       notificationsEnabled,
       notificationPrefsUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     };
-    if (!notificationsEnabled) update.fcmToken = admin.firestore.FieldValue.delete();
+    if (!notificationsEnabled) {
+      update.fcmToken = admin.firestore.FieldValue.delete();
+    }
     await db.collection("users").doc(uid).update(update);
     return res.json({ message: "Notification preferences saved" });
   } catch (err) {

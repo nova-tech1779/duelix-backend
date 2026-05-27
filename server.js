@@ -1253,7 +1253,7 @@ app.post("/store/initialize-payment", verifyToken, async (req, res) => {
 // Duplicate references blocked (409).
 // Referral reward granted on first purchase only.
 // =============================================================
-app.post("/store/verify-payment", verifyToken, async (req, res) => {
+app.post("/store/verify-purchase", verifyToken, async (req, res) => {
   const { reference } = req.body;
   const uid = req.user.uid;
 

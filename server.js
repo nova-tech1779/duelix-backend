@@ -2152,7 +2152,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         displayName:           name,
         phone,
         email:                 email != null ? email : "",
-        coins:                 20,
+        coins:                 10,
         wins:                  0,
         losses:                0,
         draws:                 0,

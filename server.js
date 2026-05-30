@@ -2034,7 +2034,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
     notifyUser(
       uid, "system", "Welcome to Duelix!",
-      "Your account is ready. You have been given 20 coins to start. Good luck!", {}
+      "Your account is ready. You have been given 10 coins to start. Good luck!", {}
     ).catch(() => {});
 
     return res.status(201).json({ message: "Profile created", uid, referralCode });

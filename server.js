@@ -151,12 +151,12 @@ function hasSubmittedResult(match) {
 // COIN PACKAGE CATALOGUE
 // =============================================================
 const COIN_PACKAGES = {
-  "coins_50":   { coins: 50,   koboAmount: 700,   currency: "GHS", label: "Starter"  },
-  "coins_105":  { coins: 105,  koboAmount: 1400,  currency: "GHS", label: "Basic"    },
-  "coins_215":  { coins: 215,  koboAmount: 2800,  currency: "GHS", label: "Standard" },
-  "coins_550":  { coins: 550,  koboAmount: 7000,  currency: "GHS", label: "Plus"     },
-  "coins_1150": { coins: 1150, koboAmount: 14000, currency: "GHS", label: "Pro"      },
-  "coins_2400": { coins: 2400, koboAmount: 28000, currency: "GHS", label: "Elite"    },
+  "coins_50":   { coins: 50,   koboAmount: 600,   currency: "GHS", label: "Starter"  },
+  "coins_105":  { coins: 105,  koboAmount: 1200,  currency: "GHS", label: "Basic"    },
+  "coins_215":  { coins: 215,  koboAmount: 2400,  currency: "GHS", label: "Standard" },
+  "coins_550":  { coins: 550,  koboAmount: 6000,  currency: "GHS", label: "Plus"     },
+  "coins_1150": { coins: 1150, koboAmount: 12000, currency: "GHS", label: "Pro"      },
+  "coins_2400": { coins: 2400, koboAmount: 24000, currency: "GHS", label: "Elite"    },
 };
 
 // =============================================================

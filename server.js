@@ -121,17 +121,14 @@ async function uniqueReferralCode() {
 //   No RC generated on bonus matches.
 //   No refunds on bonus matches.
 // =============================================================
-const pool         = (entryFee) => entryFee * 2;
-const winnerReward = (entryFee) => Math.floor(entryFee * 1.00);
-const winnerRc     = (entryFee) => Math.floor(entryFee * 0.60);
-const loserReward  = (entryFee) => Math.floor(entryFee * 0.10);
-const platformFee  = (entryFee) =>
+const pool             = (entryFee) => entryFee * 2;
+const winnerReward     = (entryFee) => Math.floor(entryFee * 1.00);
+const winnerRc         = (entryFee) => Math.floor(entryFee * 0.60);
+const loserReward      = (entryFee) => Math.floor(entryFee * 0.10);
+const platformFee      = (entryFee) =>
   pool(entryFee) - winnerReward(entryFee) - loserReward(entryFee);
-
-const drawRefund      = (entryFee) => Math.floor(entryFee * 0.90);
-const drawPlatformFee = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
-
-// Bonus match: winner gets entryFee as gameplay coins, loser gets 0.
+const drawRefund       = (entryFee) => Math.floor(entryFee * 0.90);
+const drawPlatformFee  = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
 const bonusWinnerReward = (entryFee) => Math.floor(entryFee * 1.00);
 
 function validateEntryFee(entryFee) {
@@ -157,7 +154,7 @@ function hasSubmittedResult(match) {
 // Validate walletType -- defaults to "gameplay" for backward compatibility.
 function validateWalletType(walletType) {
   if (walletType === "bonus") return "bonus";
-  return "gameplay"; // default; covers undefined, null, "gameplay"
+  return "gameplay";
 }
 
 // =============================================================
@@ -220,6 +217,10 @@ function computeFairPlayRating(data) {
   return Math.max(0, Math.min(100, Math.round(base)));
 }
 
+// DEFAULT_TRUST_FIELDS:
+//   - bonusMatchUsed and firstPurchaseDone REMOVED (requirements 9-11)
+//   - lastSeen ADDED (requirement 2)
+//   - bonusCoins included (new users get 10, existing get 0 via migration)
 const DEFAULT_TRUST_FIELDS = {
   trustScore:          80,
   completedMatches:    0,
@@ -235,8 +236,8 @@ const DEFAULT_TRUST_FIELDS = {
   onlineStatus:        true,
   friendRequests:      true,
   rcBalance:           0,
-  // bonusCoins is always initialized to 10 for all new users.
-  bonusCoins:          10,
+  // bonusCoins: new users get 10 (set in create-profile, not here)
+  // lastSeen: set explicitly in create-profile
 };
 
 function applyTrustUpdate(t, userRef, userData) {
@@ -425,6 +426,7 @@ async function tryGrantReferralReward(uid) {
       if (!referrerDoc.exists) throw new Error("Referrer not found");
       if (freshUser.data().referralRewardGranted) return;
 
+      // Referral reward: credited as coins (gameplay coins), not bonusCoins
       t.update(userRef, {
         coins:                 inc(freshUser.data().coins, 5),
         referralRewardGranted: true,
@@ -458,40 +460,72 @@ async function tryGrantReferralReward(uid) {
 
 // =============================================================
 // LIVE ACTIVITY HELPERS
+//
+// Changes (requirements 3-6):
+//   - onlinePlayers counted using lastSeen (within last 5 minutes)
+//   - recentWinners capped at 3 entries (newest first)
+//   - matchesPlayedToday resets automatically at 00:00 UTC
 // =============================================================
 
 function todayUtc() {
   return new Date().toISOString().split("T")[0];
 }
 
+// Counts users whose lastSeen is within the last 5 minutes.
+// Does NOT use fcmToken. (requirement 1, 3, 4)
+async function countOnlinePlayers() {
+  try {
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const snap = await db.collection("users")
+      .where("lastSeen", ">=", admin.firestore.Timestamp.fromDate(fiveMinutesAgo))
+      .limit(1000)
+      .get();
+    return snap.size;
+  } catch (err) {
+    console.error("[countOnlinePlayers]", err.message);
+    return 0;
+  }
+}
+
+// Updates the platform live_activity document.
+// recentWinners: capped at 3, newest first (requirement 5).
+// matchesPlayedToday: resets at UTC midnight (requirement 6).
+// onlinePlayers: computed via lastSeen (requirement 4).
 async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
   try {
     const ref   = db.collection("platform").doc("live_activity");
     const today = todayUtc();
-    const snap  = await ref.get();
+
+    // Count online players using lastSeen (requirement 4)
+    const onlineCount = await countOnlinePlayers();
+
+    const snap = await ref.get();
 
     if (!snap.exists) {
+      const winners = (!isDraw && winnerUsername)
+        ? [{ username: winnerUsername, entryFee: entryFee || 0, timestamp: new Date().toISOString() }]
+        : [];
       await ref.set({
         matchesPlayedToday: 1,
-        onlinePlayers:      0,
-        recentWinners:      isDraw ? [] : [
-          {
-            username:  winnerUsername || "Player",
-            entryFee:  entryFee || 0,
-            timestamp: admin.firestore.FieldValue.serverTimestamp(),
-          },
-        ],
-        lastResetDate: today,
-        updatedAt:     admin.firestore.FieldValue.serverTimestamp(),
+        onlinePlayers:      onlineCount,
+        recentWinners:      winners,
+        lastResetDate:      today,
+        updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
       });
       return;
     }
 
-    const data           = snap.data();
-    const lastReset      = data.lastResetDate || "";
-    const needsReset     = lastReset !== today;
-    const currentCount   = needsReset ? 0 : (Number(data.matchesPlayedToday) || 0);
-    const currentWinners = needsReset ? [] : (Array.isArray(data.recentWinners) ? data.recentWinners : []);
+    const data = snap.data();
+
+    // Auto-reset matchesPlayedToday at UTC midnight (requirement 6)
+    const lastReset    = data.lastResetDate || "";
+    const needsReset   = lastReset !== today;
+    const currentCount = needsReset ? 0 : (Number(data.matchesPlayedToday) || 0);
+
+    // recentWinners: reset if new day, otherwise use stored. Cap at 3 (requirement 5).
+    const currentWinners = needsReset
+      ? []
+      : (Array.isArray(data.recentWinners) ? data.recentWinners : []);
 
     let updatedWinners = currentWinners;
     if (!isDraw && winnerUsername) {
@@ -500,12 +534,13 @@ async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
         entryFee:  entryFee || 0,
         timestamp: new Date().toISOString(),
       };
-      updatedWinners = [newEntry, ...currentWinners].slice(0, 10);
+      // Prepend new winner and keep only the 3 most recent (requirement 5)
+      updatedWinners = [newEntry, ...currentWinners].slice(0, 3);
     }
 
     await ref.set({
       matchesPlayedToday: currentCount + 1,
-      onlinePlayers:      data.onlinePlayers || 0,
+      onlinePlayers:      onlineCount,
       recentWinners:      updatedWinners,
       lastResetDate:      today,
       updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
@@ -516,16 +551,17 @@ async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
   }
 }
 
-async function updateOnlinePlayerCount() {
+// Updates lastSeen for a user. Called on authenticated actions.
+// This is what determines online status (requirement 2).
+async function touchLastSeen(uid) {
+  if (!uid) return;
   try {
-    const snap  = await db.collection("users").where("fcmToken", "!=", null).limit(1000).get();
-    const count = snap.size;
-    await db.collection("platform").doc("live_activity").set(
-      { onlinePlayers: count, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+    await db.collection("users").doc(uid).set(
+      { lastSeen: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
     );
   } catch (err) {
-    console.error("[updateOnlinePlayerCount]", err.message);
+    console.error("[touchLastSeen] uid=" + uid + " err=" + err.message);
   }
 }
 
@@ -637,6 +673,7 @@ function verifyPaystackTransaction(reference) {
 
 // =============================================================
 // SHARED COIN-CREDIT LOGIC
+// bonusMatchUsed / firstPurchaseDone checks removed (requirement 9)
 // =============================================================
 async function creditCoinsForReference(safeRef, uid, pkg, paystackEmail) {
   const dupSnap = await db
@@ -773,7 +810,6 @@ function notificationFilterTag(type) {
     "match_auto_resolved", "match_auto_cancelled", "match_dispute_opened",
     "match_dispute_resolved", "rematch_requested", "rematch_accepted",
     "rematch_declined", "match_result",
-    // bonus match types
     "bonus_match_won", "bonus_match_lost",
   ];
   const rewardTypes = [
@@ -888,7 +924,6 @@ function notifyMatchWon(userId, matchId, coinsWon, rcEarned) {
   );
 }
 
-// Bonus match win notification -- no RC, reward is gameplay coins.
 function notifyBonusMatchWon(userId, matchId, coinsWon) {
   return notifyUser(
     userId, "bonus_match_won", "Bonus Match Won!",
@@ -897,7 +932,6 @@ function notifyBonusMatchWon(userId, matchId, coinsWon) {
   );
 }
 
-// Bonus match loss notification -- no refund.
 function notifyBonusMatchLost(userId, matchId) {
   return notifyUser(
     userId, "bonus_match_lost", "Bonus Match Over",
@@ -1065,10 +1099,8 @@ function notifyRoomTimer(userId, matchId, alertType) {
 // =============================================================
 // REWARD DISTRIBUTION -- GAMEPLAY CONFIRM-RESULT PATH
 //
-// walletType == "gameplay":
-//   Winner coins = entryFee * 1.00
-//   Winner RC    = entryFee * 0.60
-//   Loser  coins = entryFee * 0.10
+// bonusMatchUsed checks REMOVED (requirement 9).
+// RC is awarded to all winners unconditionally.
 // =============================================================
 async function distributeReward(t, match, matchRef, confirmedWinner) {
   const winner  = winnerReward(match.entryFee);
@@ -1119,9 +1151,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     applyCleanMatchReward(t, playerA_Ref, aUpdated);
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
 
-    if (!playerA_Data.bonusMatchUsed) t.update(playerA_Ref, { bonusMatchUsed: true });
-    if (!playerB_Data.bonusMatchUsed) t.update(playerB_Ref, { bonusMatchUsed: true });
-
     const platformCoins = platformDoc.exists
       ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, {
@@ -1149,12 +1178,14 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       totalMatches:     inc(loserData.totalMatches     != null ? loserData.totalMatches     : 0),
     });
 
+    // Credit winner coins
     t.update(winnerRef, {
       coins:            inc(winnerData.coins            != null ? winnerData.coins            : 0, winner),
       wins:             inc(winnerData.wins             != null ? winnerData.wins             : 0),
       totalMatches:     inc(winnerData.totalMatches     != null ? winnerData.totalMatches     : 0),
       completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0),
     });
+    // Credit loser consolation coins
     t.update(loserRef, {
       coins:            inc(loserData.coins            != null ? loserData.coins            : 0, loser),
       losses:           inc(loserData.losses           != null ? loserData.losses           : 0),
@@ -1162,15 +1193,12 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    const bonusMatchUsed = winnerData.bonusMatchUsed === true;
-    if (rc > 0 && bonusMatchUsed) {
+    // Credit winner RC unconditionally (bonusMatchUsed check removed per requirement 9)
+    if (rc > 0) {
       t.update(winnerRef, {
         rcBalance: (Number(winnerData.rcBalance) || 0) + rc,
       });
     }
-
-    if (!winnerData.bonusMatchUsed) t.update(winnerRef, { bonusMatchUsed: true });
-    if (!loserData.bonusMatchUsed)  t.update(loserRef,  { bonusMatchUsed: true });
 
     applyCleanMatchReward(t, winnerRef, winnerUpdated);
     applyCleanMatchReward(t, loserRef,  loserUpdated);
@@ -1182,7 +1210,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    if (rc > 0 && bonusMatchUsed) {
+    if (rc > 0) {
       createTransactionRecord(
         confirmedWinner, "rc_earned", rc,
         "RC earned for winning match " + match.id,
@@ -1213,13 +1241,8 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION -- BONUS CONFIRM-RESULT PATH
-//
-// walletType == "bonus":
-//   Players pay with bonusCoins.
-//   Winner receives gameplayCoins = entryFee.
-//   Loser receives nothing.
-//   No RC generated.
-//   No refunds.
+// No RC. Winner gets gameplay coins. No refunds.
+// bonusMatchUsed checks REMOVED (requirement 9).
 // =============================================================
 async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
   const playerA_Ref = db.collection("users").doc(match.playerA);
@@ -1237,8 +1260,6 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
-    // On a bonus match draw, no refund, no reward.
-    // Update stats only.
     t.update(playerA_Ref, {
       draws:            inc(playerA_Data.draws),
       totalMatches:     inc(playerA_Data.totalMatches),
@@ -1249,7 +1270,6 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
       totalMatches:     inc(playerB_Data.totalMatches),
       completedMatches: inc(playerB_Data.completedMatches),
     });
-
     updateLiveActivity(null, match.entryFee, true).catch(() => {});
 
   } else {
@@ -1263,14 +1283,12 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
 
     const bonusWin = bonusWinnerReward(match.entryFee);
 
-    // Credit winner with gameplay coins (coins field).
     t.update(winnerRef, {
       coins:            inc(winnerData.coins != null ? winnerData.coins : 0, bonusWin),
       wins:             inc(winnerData.wins  != null ? winnerData.wins  : 0),
       totalMatches:     inc(winnerData.totalMatches     != null ? winnerData.totalMatches     : 0),
       completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0),
     });
-    // Loser gets nothing, only stat update.
     t.update(loserRef, {
       losses:           inc(loserData.losses           != null ? loserData.losses           : 0),
       totalMatches:     inc(loserData.totalMatches     != null ? loserData.totalMatches     : 0),
@@ -1295,11 +1313,15 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
     rematchRequestedAt: null,
   });
 
-  return { winner: confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee), rc: 0, loser: 0, confirmedWinner };
+  return {
+    winner: confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee),
+    rc: 0, loser: 0, confirmedWinner,
+  };
 }
 
 // =============================================================
 // REWARD DISTRIBUTION -- GAMEPLAY AUTO-RESOLVE PATH
+// bonusMatchUsed checks REMOVED (requirement 9).
 // =============================================================
 async function distributeRewardAutoResolve(
   t, match, matchRef, confirmedWinner, nonSubmitterUid
@@ -1352,9 +1374,6 @@ async function distributeRewardAutoResolve(
     applyCleanMatchReward(t, playerA_Ref, aUpdated);
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
 
-    if (!playerA_Data.bonusMatchUsed) t.update(playerA_Ref, { bonusMatchUsed: true });
-    if (!playerB_Data.bonusMatchUsed) t.update(playerB_Ref, { bonusMatchUsed: true });
-
     const platformCoins = platformDoc.exists
       ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, {
@@ -1395,15 +1414,12 @@ async function distributeRewardAutoResolve(
       completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0),
     });
 
-    const bonusMatchUsed = winnerData.bonusMatchUsed === true;
-    if (rc > 0 && confirmedWinner !== nonSubmitterUid && bonusMatchUsed) {
+    // Credit winner RC unconditionally (bonusMatchUsed check removed per requirement 9)
+    if (rc > 0 && confirmedWinner !== nonSubmitterUid) {
       t.update(winnerRef, {
         rcBalance: (Number(winnerData.rcBalance) || 0) + rc,
       });
     }
-
-    if (!winnerData.bonusMatchUsed) t.update(winnerRef, { bonusMatchUsed: true });
-    if (!loserData.bonusMatchUsed)  t.update(loserRef,  { bonusMatchUsed: true });
 
     if (confirmedWinner !== nonSubmitterUid) {
       applyCleanMatchReward(t, winnerRef, winnerUpdated);
@@ -1419,7 +1435,7 @@ async function distributeRewardAutoResolve(
       lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
 
-    if (rc > 0 && confirmedWinner !== nonSubmitterUid && bonusMatchUsed) {
+    if (rc > 0 && confirmedWinner !== nonSubmitterUid) {
       createTransactionRecord(
         confirmedWinner, "rc_earned", rc,
         "RC earned for winning match (auto-resolved) " + match.id,
@@ -1450,6 +1466,7 @@ async function distributeRewardAutoResolve(
 
 // =============================================================
 // REWARD DISTRIBUTION -- BONUS AUTO-RESOLVE PATH
+// bonusMatchUsed checks REMOVED (requirement 9).
 // =============================================================
 async function distributeBonusRewardAutoResolve(
   t, match, matchRef, confirmedWinner, nonSubmitterUid
@@ -1491,7 +1508,6 @@ async function distributeBonusRewardAutoResolve(
 
     const bonusWin = bonusWinnerReward(match.entryFee);
 
-    // Only award winner if they were the submitter (non-submitter loses by default on auto-resolve).
     if (confirmedWinner !== nonSubmitterUid) {
       t.update(winnerRef, {
         coins:            inc(winnerData.coins != null ? winnerData.coins : 0, bonusWin),
@@ -1530,7 +1546,10 @@ async function distributeBonusRewardAutoResolve(
     rematchRequestedAt: null,
   });
 
-  return { winner: confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee), rc: 0, loser: 0, confirmedWinner };
+  return {
+    winner: confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee),
+    rc: 0, loser: 0, confirmedWinner,
+  };
 }
 
 // =============================================================
@@ -1538,6 +1557,24 @@ async function distributeBonusRewardAutoResolve(
 // =============================================================
 app.get("/",       (_req, res) => res.send("Duelix backend is live"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
+
+// =============================================================
+// LAST SEEN UPDATE ENDPOINT
+// Called by the Flutter app on app resume / periodic heartbeat.
+// Updates the user's lastSeen timestamp for online presence.
+// =============================================================
+app.post("/user/last-seen", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  try {
+    await db.collection("users").doc(uid).set(
+      { lastSeen: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+    return res.json({ message: "lastSeen updated" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
 
 // =============================================================
 // PAYSTACK WEBHOOK
@@ -2024,6 +2061,8 @@ app.get("/rc/history", verifyToken, async (req, res) => {
 
 // =============================================================
 // FCM TOKEN
+// Note: FCM token is used for push delivery ONLY.
+// Online presence is tracked via lastSeen, NOT fcmToken.
 // =============================================================
 app.post("/save-fcm-token", verifyToken, async (req, res) => {
   const uid       = req.user.uid;
@@ -2036,7 +2075,8 @@ app.post("/save-fcm-token", verifyToken, async (req, res) => {
       fcmToken:          token.trim(),
       fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    updateOnlinePlayerCount().catch(() => {});
+    // Also update lastSeen when FCM token is saved (app is active)
+    touchLastSeen(uid).catch(() => {});
     return res.json({ message: "FCM token saved" });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -2050,7 +2090,6 @@ app.delete("/save-fcm-token", verifyToken, async (req, res) => {
       fcmToken:          admin.firestore.FieldValue.delete(),
       fcmTokenUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
-    updateOnlinePlayerCount().catch(() => {});
     return res.json({ message: "FCM token removed" });
   } catch (err) {
     return res.status(500).json({ error: err.message });
@@ -2139,7 +2178,12 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // CREATE USER PROFILE
-// Bonus coins field is always initialized to 0 for new users.
+//
+// Changes (requirements 2, 7, 9, 11):
+//   - lastSeen added on registration (requirement 2)
+//   - bonusCoins: 10 for new users (requirement 7)
+//   - coins: 0 for new users (gameplay wallet starts empty)
+//   - bonusMatchUsed / firstPurchaseDone REMOVED (requirement 9, 11)
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2198,14 +2242,17 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         displayName:           name,
         phone,
         email:                 email != null ? email : "",
+        // Gameplay coins start at 0. bonusCoins = 10 for new users.
         coins:                 0,
-        bonusCoins:            10,   // Always 10 for new users.
+        bonusCoins:            10,
         wins:                  0,
         losses:                0,
         draws:                 0,
         totalMatches:          0,
         loginStreak:           0,
         lastLogin:             null,
+        // lastSeen set on registration (requirement 2)
+        lastSeen:              admin.firestore.FieldValue.serverTimestamp(),
         avatar:                "assets/avatars/avatar1.png",
         referralCode,
         referredBy:            null,
@@ -2213,7 +2260,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         referralCount:         0,
         referralRewardGranted: false,
         firstPurchaseDone:     false,
-        bonusMatchUsed:        false,
+        // bonusMatchUsed intentionally NOT set (requirement 9, 11)
         fcmToken:              null,
         deviceId:              deviceId  || null,
         installId:             installId || null,
@@ -2224,7 +2271,7 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
     notifyUser(
       uid, "system", "Welcome to Duelix!",
-      "Your account is ready! You have 10 starter coins. Play and win to earn more!", {}
+      "Your account is ready! You have 10 bonus coins to start. Play and win to earn more!", {}
     ).catch(() => {});
 
     return res.status(201).json({ message: "Profile created", uid, referralCode });
@@ -2243,23 +2290,58 @@ app.get("/user-exists/:uid", async (req, res) => {
 });
 
 // =============================================================
-// MIGRATION: ENSURE BONUS COINS FIELD
+// MIGRATION: ENSURE BONUS COINS AND LAST SEEN
 //
-// One-time migration for existing users who do not yet have
-// a bonusCoins field. Safe to call multiple times (idempotent).
-// Sets bonusCoins = 0 only if the field does not already exist.
+// Backward-compatible migration for existing users.
+// Sets bonusCoins = 0 if missing (requirement 8).
+// Sets lastSeen = now if missing (requirement 2).
+// Removes bonusMatchUsed field if present (requirement 10).
+// Safe to call multiple times (idempotent).
+// Does NOT modify coins, rcBalance, transactions, or matches.
 // =============================================================
-app.post("/users/ensure-bonus-coins", verifyToken, async (req, res) => {
+app.post("/users/ensure-fields", verifyToken, async (req, res) => {
   const uid = req.user.uid;
   try {
     const userRef = db.collection("users").doc(uid);
     const userDoc = await userRef.get();
     if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
-    if (userDoc.data().bonusCoins !== undefined) {
-      return res.json({ message: "bonusCoins already initialized", bonusCoins: userDoc.data().bonusCoins });
+
+    const data    = userDoc.data();
+    const updates = {};
+
+    // Ensure bonusCoins (requirement 8): existing users get 0 if missing
+    if (data.bonusCoins === undefined || data.bonusCoins === null) {
+      updates.bonusCoins = 0;
     }
-    await userRef.set({ bonusCoins: 0 }, { merge: true });
-    return res.json({ message: "bonusCoins initialized to 0", bonusCoins: 0 });
+
+    // Ensure lastSeen (requirement 2): add if missing
+    if (!data.lastSeen) {
+      updates.lastSeen = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    // Remove bonusMatchUsed if it exists (requirement 10)
+    if (data.bonusMatchUsed !== undefined) {
+      updates.bonusMatchUsed = admin.firestore.FieldValue.delete();
+    }
+
+    // Remove firstMatchBonusUsed if it exists (requirement 10 -- variant field name)
+    if (data.firstMatchBonusUsed !== undefined) {
+      updates.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await userRef.set(updates, { merge: true });
+    }
+
+    return res.json({
+      message:    "Fields ensured",
+      bonusCoins: updates.bonusCoins !== undefined ? updates.bonusCoins : data.bonusCoins,
+      lastSeen:   updates.lastSeen !== undefined ? "set" : "already_present",
+      removed:    [
+        data.bonusMatchUsed    !== undefined ? "bonusMatchUsed"    : null,
+        data.firstMatchBonusUsed !== undefined ? "firstMatchBonusUsed" : null,
+      ].filter(Boolean),
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -2329,8 +2411,13 @@ app.post("/apply-referral", verifyToken, async (req, res) => {
 
 // =============================================================
 // USER ENDPOINTS
+//
+// GET /user/:uid now:
+//   - Patches missing bonusCoins = 0 for existing users (req 8)
+//   - Patches missing lastSeen for existing users (req 2)
+//   - Removes bonusMatchUsed / firstMatchBonusUsed if present (req 10)
+//   - Does NOT add bonusMatchUsed to new users (req 11)
 // =============================================================
-
 app.get("/user/:uid", verifyToken, async (req, res) => {
   try {
     const doc = await db.collection("users").doc(req.params.uid).get();
@@ -2338,8 +2425,28 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
 
     const data = doc.data();
 
-    // Patch bonusCoins for existing users who don't have it yet.
-    const needsBonusPatch = data.bonusCoins === undefined;
+    // Build patch for missing/stale fields. Applied in background, not blocking.
+    const patch = {};
+
+    // Ensure bonusCoins (requirement 8)
+    if (data.bonusCoins === undefined || data.bonusCoins === null) {
+      patch.bonusCoins = 0;
+    }
+
+    // Ensure lastSeen (requirement 2)
+    if (!data.lastSeen) {
+      patch.lastSeen = admin.firestore.FieldValue.serverTimestamp();
+    }
+
+    // Remove bonusMatchUsed if it exists (requirement 10)
+    if (data.bonusMatchUsed !== undefined) {
+      patch.bonusMatchUsed = admin.firestore.FieldValue.delete();
+    }
+
+    // Remove firstMatchBonusUsed if it exists (requirement 10)
+    if (data.firstMatchBonusUsed !== undefined) {
+      patch.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+    }
 
     if (data.trustScore === undefined) {
       const trustFields = {
@@ -2355,16 +2462,21 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
         cleanMatchBonus:       0,
         fairPlayBonus:         0,
         rcBalance:             data.rcBalance             || 0,
-        bonusCoins:            needsBonusPatch ? 0 : data.bonusCoins,
-        bonusMatchUsed:        data.bonusMatchUsed        || false,
+        bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
         firstPurchaseDone:     data.firstPurchaseDone     || false,
         referralRewardGranted: data.referralRewardGranted || false,
         onlineStatus:          data.onlineStatus !== undefined ? data.onlineStatus : true,
         friendRequests:        data.friendRequests !== undefined ? data.friendRequests : true,
       };
+      // Apply patch fields on top
+      Object.assign(trustFields, patch);
       db.collection("users").doc(req.params.uid)
-        .set(trustFields, { merge: true }).catch(() => {});
-      return res.json(Object.assign({}, data, trustFields));
+        .set(Object.assign({}, trustFields, patch), { merge: true }).catch(() => {});
+      // Remove bonusMatchUsed from returned object
+      const result = Object.assign({}, data, trustFields);
+      delete result.bonusMatchUsed;
+      delete result.firstMatchBonusUsed;
+      return res.json(result);
     }
 
     const needsPatch =
@@ -2372,26 +2484,34 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
       data.fairPlayBonus         === undefined ||
       data.rcBalance             === undefined ||
       data.bonusCoins            === undefined ||
-      data.bonusMatchUsed        === undefined ||
       data.firstPurchaseDone     === undefined ||
-      data.referralRewardGranted === undefined;
+      data.referralRewardGranted === undefined ||
+      !data.lastSeen             ||
+      data.bonusMatchUsed        !== undefined ||
+      data.firstMatchBonusUsed   !== undefined;
 
-    if (needsPatch) {
-      const patch = {
+    if (needsPatch || Object.keys(patch).length > 0) {
+      const fullPatch = Object.assign({
         cleanMatchBonus:       data.cleanMatchBonus       || 0,
         fairPlayBonus:         data.fairPlayBonus         || 0,
         rcBalance:             data.rcBalance             || 0,
         bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
-        bonusMatchUsed:        data.bonusMatchUsed        || false,
         firstPurchaseDone:     data.firstPurchaseDone     || false,
         referralRewardGranted: data.referralRewardGranted || false,
-      };
+      }, patch);
       db.collection("users").doc(req.params.uid)
-        .set(patch, { merge: true }).catch(() => {});
-      return res.json(Object.assign({}, data, patch));
+        .set(fullPatch, { merge: true }).catch(() => {});
+      const result = Object.assign({}, data, fullPatch);
+      delete result.bonusMatchUsed;
+      delete result.firstMatchBonusUsed;
+      return res.json(result);
     }
 
-    return res.json(data);
+    // Return data without bonusMatchUsed / firstMatchBonusUsed
+    const result = Object.assign({}, data);
+    delete result.bonusMatchUsed;
+    delete result.firstMatchBonusUsed;
+    return res.json(result);
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -2480,7 +2600,7 @@ app.post("/reset-account", verifyToken, async (req, res) => {
   const { coins } = req.body;
   const resetCoins =
     coins != null && Number.isInteger(coins) && coins >= 0 && coins <= 100000
-      ? coins : 10;
+      ? coins : 0;
   try {
     await db.collection("users").doc(req.user.uid).update({
       coins: resetCoins, wins: 0, losses: 0, draws: 0, totalMatches: 0,
@@ -2496,6 +2616,7 @@ app.post("/reset-account", verifyToken, async (req, res) => {
 // =============================================================
 
 // Create private match -- supports walletType "gameplay" | "bonus".
+// bonusMatchUsed checks REMOVED (requirement 9).
 app.post("/matches/create", verifyToken, async (req, res) => {
   const { game, entryFee, walletType: rawWalletType } = req.body;
   const uid        = req.user.uid;
@@ -2574,7 +2695,7 @@ app.get("/matches", verifyToken, async (req, res) => {
   }
 });
 
-// Join match -- validates that joiner uses the same walletType as the match.
+// Join match -- validates same walletType. bonusMatchUsed checks REMOVED.
 app.post("/matches/join", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   const uid = req.user.uid;
@@ -2639,7 +2760,6 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
 
   try {
     let entryFeeRefunded = 0;
-    let walletType = "gameplay";
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const userRef  = db.collection("users").doc(uid);
@@ -2648,9 +2768,9 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
       if (!matchDoc.exists) throw new Error("Match not found");
       if (!userDoc.exists)  throw new Error("User not found");
 
-      const match    = matchDoc.data();
-      const userData = userDoc.data();
-      walletType     = validateWalletType(match.walletType);
+      const match      = matchDoc.data();
+      const userData   = userDoc.data();
+      const walletType = validateWalletType(match.walletType);
 
       if (match.playerA !== uid)      throw new Error("Only the match creator can cancel");
       if (match.playerB != null)      throw new Error("Cannot cancel -- opponent has already joined");
@@ -2658,7 +2778,6 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
 
       entryFeeRefunded = match.entryFee;
 
-      // Refund to the correct wallet.
       if (walletType === "bonus") {
         const bonusCoins = userData.bonusCoins != null ? Number(userData.bonusCoins) : 0;
         t.update(userRef, { bonusCoins: bonusCoins + match.entryFee });
@@ -2679,8 +2798,7 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
   }
 });
 
-// Quick match -- supports walletType "gameplay" | "bonus".
-// Only matches players using the same wallet type.
+// Quick match -- same wallet type matching. bonusMatchUsed checks REMOVED.
 app.post("/matches/quick-match", verifyToken, async (req, res) => {
   const { game, entryFee, walletType: rawWalletType } = req.body;
   const uid        = req.user.uid;
@@ -2697,7 +2815,6 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
   try {
     let matchId = null, didCreate = false, playerAUid = null;
 
-    // Find an existing waiting match with the same wallet type.
     const candidateSnap = await db.collection("matches")
       .where("status",     "==", "waiting")
       .where("game",       "==", gameUpper)
@@ -2807,9 +2924,7 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
   const uid = req.user.uid;
 
   if (!matchId || myScore === undefined || opponentScore === undefined) {
-    return res.status(400).json({
-      error: "matchId, myScore, opponentScore required",
-    });
+    return res.status(400).json({ error: "matchId, myScore, opponentScore required" });
   }
   try {
     validateScore(myScore, "myScore");
@@ -2850,7 +2965,7 @@ app.post("/matches/submit-result", verifyToken, async (req, res) => {
   }
 });
 
-// Confirm result -- routes to gameplay or bonus settlement based on walletType.
+// Confirm result -- routes to gameplay or bonus settlement.
 app.post("/matches/confirm-result", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   const uid = req.user.uid;
@@ -2876,8 +2991,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       const submitter      = match.submittedBy;
       const confirmer      = uid;
-      const scoreOf        = match.result && match.result.scoreOf
-        ? match.result.scoreOf : {};
+      const scoreOf        = match.result && match.result.scoreOf ? match.result.scoreOf : {};
       const submitterScore = scoreOf[submitter] != null ? scoreOf[submitter] : 0;
       const confirmerScore = scoreOf[confirmer] != null ? scoreOf[confirmer] : 0;
 
@@ -2905,10 +3019,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
       notifyResultConfirmed(matchSnapshot.playerB, matchId_).catch(() => {});
 
       if (walletType === "bonus") {
-        // Bonus match notifications.
-        if (w === "draw") {
-          // No reward notifications needed for bonus draw.
-        } else {
+        if (w !== "draw") {
           const loserUid = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA;
           const bonusWin = bonusWinnerReward(entryFee);
           notifyBonusMatchWon(w,         matchId_, bonusWin).catch(() => {});
@@ -2923,7 +3034,6 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
           ).catch(() => {});
         }
       } else {
-        // Gameplay match notifications (unchanged).
         if (w === "draw") {
           const refund = drawRefund(entryFee);
           notifyMatchDraw(matchSnapshot.playerA, matchId_, refund).catch(() => {});
@@ -3073,7 +3183,7 @@ app.get("/matches/history", verifyToken, async (req, res) => {
   }
 });
 
-// Auto-resolve -- routes to gameplay or bonus settlement based on walletType.
+// Auto-resolve -- routes to gameplay or bonus. bonusMatchUsed checks REMOVED.
 app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   if (!matchId) return res.status(400).json({ error: "matchId required" });
@@ -3088,8 +3198,7 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
 
       const match = matchDoc.data();
       if (match.status === "completed" || match.rewarded || match.autoResolved) {
-        result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true };
-        return;
+        result = { confirmedWinner: match.confirmedWinner, alreadyResolved: true }; return;
       }
       if (match.status === "cancelled") { result = { alreadyCancelled: true }; return; }
       if (match.status !== "active") {
@@ -3100,11 +3209,9 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       }
 
       matchSnapshot = match;
-      const scoreOf        = match.result && match.result.scoreOf
-        ? match.result.scoreOf : {};
+      const scoreOf        = match.result && match.result.scoreOf ? match.result.scoreOf : {};
       const submitter      = match.submittedBy;
-      const other          = submitter === match.playerA
-        ? match.playerB : match.playerA;
+      const other          = submitter === match.playerA ? match.playerB : match.playerA;
       const submitterScore = scoreOf[submitter] != null ? scoreOf[submitter] : 0;
       const otherScore     = scoreOf[other]     != null ? scoreOf[other]     : 0;
 
@@ -3162,12 +3269,10 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
           const refund = drawRefund(entryFee);
           notifyMatchDraw(matchSnapshot.playerA, matchId_, refund).catch(() => {});
           notifyMatchDraw(matchSnapshot.playerB, matchId_, refund).catch(() => {});
-          createTransactionRecord(
-            matchSnapshot.playerA, "match_draw", refund,
+          createTransactionRecord(matchSnapshot.playerA, "match_draw", refund,
             "Draw refund (auto-resolved)", { matchId: matchId_, walletType: "gameplay" }
           ).catch(() => {});
-          createTransactionRecord(
-            matchSnapshot.playerB, "match_draw", refund,
+          createTransactionRecord(matchSnapshot.playerB, "match_draw", refund,
             "Draw refund (auto-resolved)", { matchId: matchId_, walletType: "gameplay" }
           ).catch(() => {});
         } else {
@@ -3181,13 +3286,11 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
           notifyMatchLost(loserUid, matchId_, losCoins).catch(() => {});
           notifyRcEarned(w, rcEarned, winCoins, matchId_).catch(() => {});
 
-          createTransactionRecord(
-            w, "match_win", winCoins,
+          createTransactionRecord(w, "match_win", winCoins,
             "Match won (auto-resolved): +" + winCoins + " coins + +" + rcEarned + " RC",
             { matchId: matchId_, rcEarned, walletType: "gameplay" }
           ).catch(() => {});
-          createTransactionRecord(
-            loserUid, "match_lost", losCoins,
+          createTransactionRecord(loserUid, "match_lost", losCoins,
             "Match lost (auto-resolved): +" + losCoins + " coins",
             { matchId: matchId_, walletType: "gameplay" }
           ).catch(() => {});
@@ -3244,7 +3347,6 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const playerA_Data = playerA_Doc.data();
       const playerB_Data = playerB_Doc.data();
 
-      // Refund entry fee to both players from the correct wallet.
       if (walletType === "bonus") {
         t.update(playerA_Ref, { bonusCoins: inc(Number(playerA_Data.bonusCoins) || 0, match.entryFee) });
         t.update(playerB_Ref, { bonusCoins: inc(Number(playerB_Data.bonusCoins) || 0, match.entryFee) });
@@ -3253,12 +3355,8 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
         t.update(playerB_Ref, { coins: inc(playerB_Data.coins, match.entryFee) });
       }
 
-      const aUpdated = Object.assign({}, playerA_Data, {
-        rageQuits: inc(playerA_Data.rageQuits),
-      });
-      const bUpdated = Object.assign({}, playerB_Data, {
-        rageQuits: inc(playerB_Data.rageQuits),
-      });
+      const aUpdated = Object.assign({}, playerA_Data, { rageQuits: inc(playerA_Data.rageQuits) });
+      const bUpdated = Object.assign({}, playerB_Data, { rageQuits: inc(playerB_Data.rageQuits) });
       t.update(playerA_Ref, { rageQuits: inc(playerA_Data.rageQuits) });
       t.update(playerB_Ref, { rageQuits: inc(playerB_Data.rageQuits) });
       applyTrustUpdate(t, playerA_Ref, aUpdated);
@@ -3273,12 +3371,8 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
     });
 
     if (!alreadyDone && matchSnapshot) {
-      notifyAutoCancelled(
-        matchSnapshot.playerA, matchId, matchSnapshot.entryFee
-      ).catch(() => {});
-      notifyAutoCancelled(
-        matchSnapshot.playerB, matchId, matchSnapshot.entryFee
-      ).catch(() => {});
+      notifyAutoCancelled(matchSnapshot.playerA, matchId, matchSnapshot.entryFee).catch(() => {});
+      notifyAutoCancelled(matchSnapshot.playerB, matchId, matchSnapshot.entryFee).catch(() => {});
     }
 
     if (alreadyDone) return res.json({ message: "No action needed" });
@@ -3313,7 +3407,6 @@ app.post("/matches/rematch-request", verifyToken, async (req, res) => {
       if (match.status !== "completed") throw new Error("Match not completed");
       if (match.rematchRequestedBy)     throw new Error("Rematch already requested");
 
-      // Check balance in correct wallet.
       if (walletType === "bonus") {
         const bonusCoins = Number(userData.bonusCoins) || 0;
         if (bonusCoins < match.entryFee) throw new Error("Insufficient Bonus Coins for rematch");
@@ -3557,6 +3650,10 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
   }
 });
 
+// =============================================================
+// ADMIN -- TRUST + FIELD MIGRATION
+// Adds lastSeen, removes bonusMatchUsed, ensures bonusCoins.
+// =============================================================
 app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
   let migrated = 0, errors = 0;
   try {
@@ -3571,17 +3668,34 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       snap.docs.forEach((doc) => {
         try {
           const data = doc.data();
-          batch.set(doc.ref, {
+          const updateFields = {
             trustScore:            computeTrustScore(data),
             fairPlayRating:        computeFairPlayRating(data),
             matchCompletionRate:   computeCompletionRate(data),
             rcBalance:             data.rcBalance             || 0,
+            // Existing users get bonusCoins = 0 if missing (requirement 8)
             bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
-            bonusMatchUsed:        data.bonusMatchUsed        || false,
             firstPurchaseDone:     data.firstPurchaseDone     || false,
             referralRewardGranted: data.referralRewardGranted || false,
             trustUpdatedAt:        admin.firestore.FieldValue.serverTimestamp(),
-          }, { merge: true });
+          };
+
+          // Ensure lastSeen for existing users (requirement 2)
+          if (!data.lastSeen) {
+            updateFields.lastSeen = admin.firestore.FieldValue.serverTimestamp();
+          }
+
+          // Remove bonusMatchUsed field (requirement 10)
+          if (data.bonusMatchUsed !== undefined) {
+            updateFields.bonusMatchUsed = admin.firestore.FieldValue.delete();
+          }
+
+          // Remove firstMatchBonusUsed field (requirement 10)
+          if (data.firstMatchBonusUsed !== undefined) {
+            updateFields.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+          }
+
+          batch.set(doc.ref, updateFields, { merge: true });
           migrated++;
         } catch (e) { errors++; }
       });
@@ -3689,6 +3803,18 @@ app.post("/update-notification-prefs", verifyToken, async (req, res) => {
 
 // =============================================================
 // REDEMPTION APPROVAL LISTENER
+//
+// Listens for changes in redemption_requests where status is
+// "approved" or "rejected". Fires automatically when an admin
+// updates the status field in Firestore.
+//
+// On each qualifying change:
+//   1. Checks processedAt to prevent duplicate processing.
+//   2. Sets processedAt immediately to claim the document.
+//   3. Creates in-app notification with adminNote.
+//   4. Sends push notification with adminNote.
+//   5. Creates a transaction record with type redemption_approved
+//      or redemption_rejected, including the adminNote.
 // =============================================================
 function startRedemptionApprovalListener() {
   console.log("[redemption-listener] Starting...");
@@ -3698,6 +3824,7 @@ function startRedemptionApprovalListener() {
     .onSnapshot(
       (snap) => {
         snap.docChanges().forEach((change) => {
+          // Process both newly added approved/rejected docs AND modifications
           if (change.type !== "modified" && change.type !== "added") return;
 
           const data   = change.doc.data();
@@ -3705,8 +3832,11 @@ function startRedemptionApprovalListener() {
           const status = data.status || "";
           const userId = data.userId || "";
 
+          // Skip if already processed (prevents duplicate notifications)
           if (data.processedAt) return;
+
           if (status !== "approved" && status !== "rejected") return;
+
           if (!userId) {
             console.warn("[redemption-listener] No userId on doc=" + docId);
             return;
@@ -3714,6 +3844,7 @@ function startRedemptionApprovalListener() {
 
           (async () => {
             try {
+              // Claim this document immediately to prevent race conditions
               await db.collection("redemption_requests").doc(docId).update({
                 processedAt: admin.firestore.FieldValue.serverTimestamp(),
               });
@@ -3728,6 +3859,7 @@ function startRedemptionApprovalListener() {
               const usdValue = Number(data.usdValue)  || 0;
 
               if (status === "approved") {
+                // In-app notification + push notification
                 await notifyUser(
                   userId,
                   "redemption_approved",
@@ -3735,6 +3867,8 @@ function startRedemptionApprovalListener() {
                   adminNote,
                   { rcAmount, usdValue, adminNote, redemptionId: docId }
                 );
+
+                // Transaction record with adminNote in description
                 await createTransactionRecord(
                   userId,
                   "redemption_approved",
@@ -3750,11 +3884,14 @@ function startRedemptionApprovalListener() {
                     accountName: data.accountName || "",
                   }
                 );
+
                 console.log(
                   "[redemption-listener] approved userId=" + userId +
                   " rc=" + rcAmount + " docId=" + docId
                 );
+
               } else {
+                // rejected path
                 await notifyUser(
                   userId,
                   "redemption_rejected",
@@ -3762,6 +3899,7 @@ function startRedemptionApprovalListener() {
                   adminNote,
                   { rcAmount, usdValue, adminNote, redemptionId: docId }
                 );
+
                 await createTransactionRecord(
                   userId,
                   "redemption_rejected",
@@ -3769,6 +3907,7 @@ function startRedemptionApprovalListener() {
                   "Redemption rejected: " + rcAmount + " RC. " + adminNote,
                   { rcAmount, usdValue, adminNote, redemptionId: docId }
                 );
+
                 console.log(
                   "[redemption-listener] rejected userId=" + userId +
                   " rc=" + rcAmount + " docId=" + docId
@@ -3849,8 +3988,7 @@ function startSystemNotificationsListener() {
                         totalSent++;
                       } catch (e) {
                         console.error(
-                          "[system-notif-listener] Failed to notify uid=" +
-                          userDoc.id + ":", e.message
+                          "[system-notif-listener] Failed uid=" + userDoc.id + ":", e.message
                         );
                       }
                     })
@@ -3866,8 +4004,7 @@ function startSystemNotificationsListener() {
                 });
 
                 console.log(
-                  "[system-notif-listener] Broadcast to all -- " +
-                  totalSent + " users notified. docId=" + docId
+                  "[system-notif-listener] Broadcast to " + totalSent + " users. docId=" + docId
                 );
 
               } else if (targetType === "multiple") {
@@ -3876,9 +4013,7 @@ function startSystemNotificationsListener() {
                   : [];
 
                 if (targetIds.length === 0) {
-                  console.warn(
-                    "[system-notif-listener] targetUserIds empty for docId=" + docId
-                  );
+                  console.warn("[system-notif-listener] Empty targetUserIds docId=" + docId);
                   return;
                 }
 
@@ -3889,21 +4024,12 @@ function startSystemNotificationsListener() {
                   deliveredAt:    admin.firestore.FieldValue.serverTimestamp(),
                 });
 
-                console.log(
-                  "[system-notif-listener] Sent to " + targetIds.length +
-                  " users. docId=" + docId
-                );
-
               } else {
-                const targetIds = Array.isArray(data.targetUserIds)
-                  ? data.targetUserIds : [];
-                const targetUid = typeof targetIds[0] === "string"
-                  ? targetIds[0].trim() : "";
+                const targetIds = Array.isArray(data.targetUserIds) ? data.targetUserIds : [];
+                const targetUid = typeof targetIds[0] === "string" ? targetIds[0].trim() : "";
 
                 if (!targetUid) {
-                  console.warn(
-                    "[system-notif-listener] No targetUid for single docId=" + docId
-                  );
+                  console.warn("[system-notif-listener] No targetUid docId=" + docId);
                   return;
                 }
 
@@ -3913,17 +4039,11 @@ function startSystemNotificationsListener() {
                   deliveredCount: 1,
                   deliveredAt:    admin.firestore.FieldValue.serverTimestamp(),
                 });
-
-                console.log(
-                  "[system-notif-listener] Sent to uid=" + targetUid +
-                  ". docId=" + docId
-                );
               }
 
             } catch (err) {
               console.error(
-                "[system-notif-listener] Error on docId=" + docId + ":",
-                err.message
+                "[system-notif-listener] Error on docId=" + docId + ":", err.message
               );
             }
           })();

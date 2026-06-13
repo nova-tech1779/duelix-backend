@@ -461,11 +461,14 @@ function todayUtc() {
 }
 
 // Counts users whose lastSeen is within the last 5 minutes.
+// This is the single source of truth for "online players".
+const ONLINE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
+
 async function countOnlinePlayers() {
   try {
-    const fiveMinutesAgo = new Date(Date.now() - 5 * 60 * 1000);
+    const cutoff = new Date(Date.now() - ONLINE_WINDOW_MS);
     const snap = await db.collection("users")
-      .where("lastSeen", ">=", admin.firestore.Timestamp.fromDate(fiveMinutesAgo))
+      .where("lastSeen", ">=", admin.firestore.Timestamp.fromDate(cutoff))
       .limit(1000)
       .get();
     return snap.size;
@@ -475,12 +478,40 @@ async function countOnlinePlayers() {
   }
 }
 
+// =============================================================
+// LIVE ACTIVITY -- ONLINE PLAYERS REFRESH (HEARTBEAT-DRIVEN)
+//
+// This is the ONLY writer of `onlinePlayers`. It runs on a fixed
+// interval (every 60s) and is driven purely by each user's
+// `lastSeen` heartbeat timestamp (>= now - 5min => online).
+// It does NOT depend on match activity in any way.
+// =============================================================
+async function refreshOnlinePlayersCount() {
+  try {
+    const onlineCount = await countOnlinePlayers();
+    const ref = db.collection("platform").doc("live_activity");
+
+    await ref.set({
+      onlinePlayers:        onlineCount,
+      onlinePlayersUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    }, { merge: true });
+  } catch (err) {
+    console.error("[refreshOnlinePlayersCount]", err.message);
+  }
+}
+
+// =============================================================
+// LIVE ACTIVITY -- MATCH COUNTER + RECENT WINNERS
+//
+// Updates matchesPlayedToday / recentWinners only. Online player
+// count is intentionally NOT touched here -- it is owned exclusively
+// by refreshOnlinePlayersCount() (heartbeat-driven, on its own
+// 60-second interval).
+// =============================================================
 async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
   try {
     const ref   = db.collection("platform").doc("live_activity");
     const today = todayUtc();
-
-    const onlineCount = await countOnlinePlayers();
 
     const snap = await ref.get();
 
@@ -490,11 +521,11 @@ async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
         : [];
       await ref.set({
         matchesPlayedToday: 1,
-        onlinePlayers:      onlineCount,
+        onlinePlayers:      0,
         recentWinners:      winners,
         lastResetDate:      today,
         updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
-      });
+      }, { merge: true });
       return;
     }
 
@@ -520,7 +551,6 @@ async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
 
     await ref.set({
       matchesPlayedToday: currentCount + 1,
-      onlinePlayers:      onlineCount,
       recentWinners:      updatedWinners,
       lastResetDate:      today,
       updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
@@ -1565,8 +1595,18 @@ app.get("/",       (_req, res) => res.send("Duelix backend is live"));
 app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // =============================================================
-// LAST SEEN UPDATE ENDPOINT
-// Called by the Flutter app on app open, resume, and heartbeat.
+// LAST SEEN UPDATE ENDPOINT (HEARTBEAT)
+// Called by the Flutter app on:
+//   - app open
+//   - app resume / return to foreground
+//   - navigation within Duelix
+//   - user actions
+//   - a recurring 60-second heartbeat timer while the app is active
+//
+// This is the ONLY signal used to determine whether a user is
+// "online". The platform live_activity.onlinePlayers field is
+// refreshed separately on a 60-second server interval based on
+// this lastSeen timestamp (see refreshOnlinePlayersCount above).
 // =============================================================
 app.post("/user/last-seen", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1576,6 +1616,27 @@ app.post("/user/last-seen", verifyToken, async (req, res) => {
       { merge: true }
     );
     return res.json({ message: "lastSeen updated" });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================
+// LIVE ACTIVITY -- PUBLIC READ ENDPOINT
+// Returns the current platform live activity document, including
+// the heartbeat-derived onlinePlayers count.
+// =============================================================
+app.get("/platform/live-activity", verifyToken, async (req, res) => {
+  try {
+    const doc = await db.collection("platform").doc("live_activity").get();
+    if (!doc.exists) {
+      return res.json({
+        matchesPlayedToday: 0,
+        onlinePlayers:      0,
+        recentWinners:      [],
+      });
+    }
+    return res.json(doc.data());
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -4025,6 +4086,32 @@ function startSystemNotificationsListener() {
 }
 
 // =============================================================
+// ONLINE PLAYERS REFRESH LOOP
+//
+// Runs independently of matches, payments, or any other feature.
+// Every 60 seconds it recalculates how many users have a `lastSeen`
+// heartbeat within the last 5 minutes and writes that count to
+// platform/live_activity.onlinePlayers.
+//
+// Frontend apps must call POST /user/last-seen:
+//   - on app open
+//   - on app resume / foreground
+//   - on navigation within Duelix
+//   - on user actions
+//   - on a recurring 60-second heartbeat timer while active
+// =============================================================
+const ONLINE_REFRESH_INTERVAL_MS = 60 * 1000; // 60 seconds
+
+function startOnlinePlayersRefreshLoop() {
+  console.log("[online-refresh] Starting (interval=" + ONLINE_REFRESH_INTERVAL_MS + "ms, window=" + ONLINE_WINDOW_MS + "ms)");
+  // Run once immediately on boot, then on a fixed interval.
+  refreshOnlinePlayersCount();
+  setInterval(() => {
+    refreshOnlinePlayersCount();
+  }, ONLINE_REFRESH_INTERVAL_MS);
+}
+
+// =============================================================
 // START
 // =============================================================
 const PORT   = process.env.PORT || 4000;
@@ -4032,6 +4119,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   console.log("Duelix backend running on port " + PORT);
   startRedemptionApprovalListener();
   startSystemNotificationsListener();
+  startOnlinePlayersRefreshLoop();
 });
 server.on("error", (err) => {
   console.error("Server error:", err.message);

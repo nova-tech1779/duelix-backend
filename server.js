@@ -119,17 +119,15 @@ async function uniqueReferralCode() {
 //   Draw: both players receive 100% of their bonusCoins entry fee refunded.
 //   No RC generated on bonus matches.
 // =============================================================
-const pool             = (entryFee) => entryFee * 2;
-const winnerReward     = (entryFee) => Math.floor(entryFee * 1.00);
-const winnerRc         = (entryFee) => Math.floor(entryFee * 0.60);
-const loserReward      = (entryFee) => Math.floor(entryFee * 0.10);
-const platformFee      = (entryFee) =>
+const pool              = (entryFee) => entryFee * 2;
+const winnerReward      = (entryFee) => Math.floor(entryFee * 1.00);
+const winnerRc          = (entryFee) => Math.floor(entryFee * 0.60);
+const loserReward       = (entryFee) => Math.floor(entryFee * 0.10);
+const platformFee       = (entryFee) =>
   pool(entryFee) - winnerReward(entryFee) - loserReward(entryFee);
-const drawRefund       = (entryFee) => Math.floor(entryFee * 0.90);
-const drawPlatformFee  = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
-// UPDATED: Bonus winner reward is now 50% of entry fee (was 100%).
+const drawRefund        = (entryFee) => Math.floor(entryFee * 0.90);
+const drawPlatformFee   = (entryFee) => (entryFee * 2) - (drawRefund(entryFee) * 2);
 const bonusWinnerReward = (entryFee) => Math.floor(entryFee * 0.50);
-// Bonus draw: full 100% refund of bonus coin entry fee to both players.
 const bonusDrawRefund   = (entryFee) => entryFee;
 
 function validateEntryFee(entryFee) {
@@ -152,7 +150,6 @@ function hasSubmittedResult(match) {
   return match.submittedBy != null;
 }
 
-// Validate walletType -- defaults to "gameplay" for backward compatibility.
 function validateWalletType(walletType) {
   if (walletType === "bonus") return "bonus";
   return "gameplay";
@@ -460,8 +457,6 @@ function todayUtc() {
   return new Date().toISOString().split("T")[0];
 }
 
-// Counts users whose lastSeen is within the last 5 minutes.
-// This is the single source of truth for "online players".
 const ONLINE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes
 
 async function countOnlinePlayers() {
@@ -478,21 +473,13 @@ async function countOnlinePlayers() {
   }
 }
 
-// =============================================================
-// LIVE ACTIVITY -- ONLINE PLAYERS REFRESH (HEARTBEAT-DRIVEN)
-//
-// This is the ONLY writer of `onlinePlayers`. It runs on a fixed
-// interval (every 60s) and is driven purely by each user's
-// `lastSeen` heartbeat timestamp (>= now - 5min => online).
-// It does NOT depend on match activity in any way.
-// =============================================================
 async function refreshOnlinePlayersCount() {
   try {
     const onlineCount = await countOnlinePlayers();
     const ref = db.collection("platform").doc("live_activity");
 
     await ref.set({
-      onlinePlayers:        onlineCount,
+      onlinePlayers:          onlineCount,
       onlinePlayersUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, { merge: true });
   } catch (err) {
@@ -500,14 +487,6 @@ async function refreshOnlinePlayersCount() {
   }
 }
 
-// =============================================================
-// LIVE ACTIVITY -- MATCH COUNTER + RECENT WINNERS
-//
-// Updates matchesPlayedToday / recentWinners only. Online player
-// count is intentionally NOT touched here -- it is owned exclusively
-// by refreshOnlinePlayersCount() (heartbeat-driven, on its own
-// 60-second interval).
-// =============================================================
 async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
   try {
     const ref   = db.collection("platform").doc("live_activity");
@@ -571,6 +550,130 @@ async function touchLastSeen(uid) {
   } catch (err) {
     console.error("[touchLastSeen] uid=" + uid + " err=" + err.message);
   }
+}
+
+// =============================================================
+// MATCH ROOM PRESENCE SYSTEM
+//
+// Presence is stored directly on the match document:
+//   playerAInMatchRoom / playerBInMatchRoom  (bool)
+//   playerAHeartbeat   / playerBHeartbeat    (Firestore Timestamp)
+//
+// A player is "🟢 In Match Room" only when:
+//   inMatchRoom == true AND heartbeat age <= PRESENCE_STALE_MS
+//
+// Otherwise: "⚫ Offline"
+//
+// This system is COMPLETELY SEPARATE from:
+//   - lastSeen / global online players
+//   - Live Activity counters
+//   - Any other platform-wide presence
+//
+// Stale cleanup loop runs every PRESENCE_CLEANUP_INTERVAL_MS and
+// flips inMatchRoom = false for any player whose heartbeat has
+// gone stale. This covers crashes, killed processes, and dropped
+// connections where the explicit leave call was never sent.
+// =============================================================
+
+const PRESENCE_STALE_MS            = 15 * 1000; // 15s — player is offline if heartbeat older than this
+const PRESENCE_CLEANUP_INTERVAL_MS = 10 * 1000; // 10s — how often the cleanup loop runs
+
+// Returns { role: "A"|"B", match } or throws.
+// Does NOT touch lastSeen or any global presence field.
+async function getPresenceRole(matchId, uid) {
+  const matchDoc = await db.collection("matches").doc(matchId).get();
+  if (!matchDoc.exists) throw new Error("Match not found");
+  const match = matchDoc.data();
+  if (match.playerA === uid) return { role: "A", match };
+  if (match.playerB === uid) return { role: "B", match };
+  throw new Error("You are not in this match");
+}
+
+// Returns true if the player's presence heartbeat is fresh.
+function isHeartbeatFresh(heartbeatTimestamp) {
+  if (!heartbeatTimestamp) return false;
+  const ms = heartbeatTimestamp._seconds
+    ? heartbeatTimestamp._seconds * 1000
+    : heartbeatTimestamp.toMillis
+      ? heartbeatTimestamp.toMillis()
+      : 0;
+  return (Date.now() - ms) <= PRESENCE_STALE_MS;
+}
+
+// Stale presence cleanup — runs on a fixed interval.
+// Scans all active matches and flips inMatchRoom = false
+// for any player whose heartbeat has expired.
+// Only writes when a change is actually needed (minimizes Firestore writes).
+async function cleanupStalePresence() {
+  try {
+    const snap = await db.collection("matches")
+      .where("status", "in", ["waiting", "active"])
+      .limit(200)
+      .get();
+
+    if (snap.empty) return;
+
+    const now = Date.now();
+    const batch = db.batch();
+    let writes = 0;
+
+    snap.docs.forEach((doc) => {
+      const d = doc.data();
+      const updates = {};
+
+      // Check player A
+      if (d.playerAInMatchRoom === true) {
+        const hb = d.playerAHeartbeat;
+        if (!hb) {
+          updates.playerAInMatchRoom = false;
+        } else {
+          const ms = hb._seconds
+            ? hb._seconds * 1000
+            : hb.toMillis ? hb.toMillis() : 0;
+          if ((now - ms) > PRESENCE_STALE_MS) {
+            updates.playerAInMatchRoom = false;
+          }
+        }
+      }
+
+      // Check player B
+      if (d.playerBInMatchRoom === true) {
+        const hb = d.playerBHeartbeat;
+        if (!hb) {
+          updates.playerBInMatchRoom = false;
+        } else {
+          const ms = hb._seconds
+            ? hb._seconds * 1000
+            : hb.toMillis ? hb.toMillis() : 0;
+          if ((now - ms) > PRESENCE_STALE_MS) {
+            updates.playerBInMatchRoom = false;
+          }
+        }
+      }
+
+      if (Object.keys(updates).length > 0) {
+        batch.update(doc.ref, updates);
+        writes++;
+      }
+    });
+
+    if (writes > 0) {
+      await batch.commit();
+      console.log("[presence-cleanup] Marked " + writes + " stale player(s) offline");
+    }
+  } catch (err) {
+    console.error("[presence-cleanup] Error:", err.message);
+  }
+}
+
+function startPresenceCleanupLoop() {
+  console.log(
+    "[presence-cleanup] Starting (interval=" + PRESENCE_CLEANUP_INTERVAL_MS +
+    "ms, stale=" + PRESENCE_STALE_MS + "ms)"
+  );
+  setInterval(() => {
+    cleanupStalePresence();
+  }, PRESENCE_CLEANUP_INTERVAL_MS);
 }
 
 // =============================================================
@@ -947,7 +1050,6 @@ function notifyBonusMatchLost(userId, matchId) {
   );
 }
 
-// NEW: Notify both players of a bonus match draw (100% refund each).
 function notifyBonusMatchDraw(userId, matchId, refundAmount) {
   return notifyUser(
     userId, "bonus_match_draw", "Bonus Match Draw!",
@@ -1251,10 +1353,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION -- BONUS CONFIRM-RESULT PATH
-//
-// Winner receives 50% of entry fee as Gameplay Coins.
-// Draw: both players receive 100% Bonus Coin refund.
-// No RC on any bonus match outcome.
 // =============================================================
 async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
   const playerA_Ref = db.collection("users").doc(match.playerA);
@@ -1272,7 +1370,6 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
-    // UPDATED: Refund 100% of bonus coin entry fee to both players on draw.
     const refund = bonusDrawRefund(match.entryFee);
     t.update(playerA_Ref, {
       bonusCoins:       inc(Number(playerA_Data.bonusCoins) || 0, refund),
@@ -1297,7 +1394,6 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
     const winnerData = winnerDoc.data();
     const loserData  = loserDoc.data();
 
-    // UPDATED: 50% of entry fee as gameplay coins.
     const bonusWin = bonusWinnerReward(match.entryFee);
 
     t.update(winnerRef, {
@@ -1487,10 +1583,6 @@ async function distributeRewardAutoResolve(
 
 // =============================================================
 // REWARD DISTRIBUTION -- BONUS AUTO-RESOLVE PATH
-//
-// Winner receives 50% of entry fee as Gameplay Coins.
-// Draw: both players receive 100% Bonus Coin refund.
-// No RC on any bonus match outcome.
 // =============================================================
 async function distributeBonusRewardAutoResolve(
   t, match, matchRef, confirmedWinner, nonSubmitterUid
@@ -1510,7 +1602,6 @@ async function distributeBonusRewardAutoResolve(
   const playerB_Data = playerB_Doc.data();
 
   if (confirmedWinner === "draw") {
-    // UPDATED: Refund 100% bonus coins to both players on draw.
     const refund = bonusDrawRefund(match.entryFee);
     t.update(playerA_Ref, {
       bonusCoins:       inc(Number(playerA_Data.bonusCoins) || 0, refund),
@@ -1535,7 +1626,6 @@ async function distributeBonusRewardAutoResolve(
     const winnerData = winnerDoc.data();
     const loserData  = loserDoc.data();
 
-    // UPDATED: 50% of entry fee as gameplay coins.
     const bonusWin = bonusWinnerReward(match.entryFee);
 
     if (confirmedWinner !== nonSubmitterUid) {
@@ -1596,17 +1686,6 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 
 // =============================================================
 // LAST SEEN UPDATE ENDPOINT (HEARTBEAT)
-// Called by the Flutter app on:
-//   - app open
-//   - app resume / return to foreground
-//   - navigation within Duelix
-//   - user actions
-//   - a recurring 60-second heartbeat timer while the app is active
-//
-// This is the ONLY signal used to determine whether a user is
-// "online". The platform live_activity.onlinePlayers field is
-// refreshed separately on a 60-second server interval based on
-// this lastSeen timestamp (see refreshOnlinePlayersCount above).
 // =============================================================
 app.post("/user/last-seen", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1623,8 +1702,6 @@ app.post("/user/last-seen", verifyToken, async (req, res) => {
 
 // =============================================================
 // LIVE ACTIVITY -- PUBLIC READ ENDPOINT
-// Returns the current platform live activity document, including
-// the heartbeat-derived onlinePlayers count.
 // =============================================================
 app.get("/platform/live-activity", verifyToken, async (req, res) => {
   try {
@@ -1637,6 +1714,134 @@ app.get("/platform/live-activity", verifyToken, async (req, res) => {
       });
     }
     return res.json(doc.data());
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================
+// MATCH ROOM PRESENCE ENDPOINTS
+//
+// POST /matches/presence/enter
+//   Called once when the Match Room screen opens.
+//   Sets playerAInMatchRoom or playerBInMatchRoom = true
+//   and stamps a fresh heartbeat timestamp.
+//
+// POST /matches/presence/heartbeat
+//   Called every 10 seconds while inside the Match Room.
+//   Re-asserts inMatchRoom = true and refreshes the heartbeat.
+//   The server stale-cleanup loop uses this to detect disconnects.
+//
+// POST /matches/presence/leave
+//   Called on dispose / app background / navigation away.
+//   Immediately sets inMatchRoom = false.
+//   Best-effort — the stale-cleanup loop covers missed calls.
+//
+// GET /matches/:matchId/presence  (optional non-realtime read)
+//   Returns computed online/offline status for both players.
+//   Flutter normally reads presence via Firestore stream instead.
+// =============================================================
+
+// POST /matches/presence/enter
+app.post("/matches/presence/enter", verifyToken, async (req, res) => {
+  const uid         = req.user.uid;
+  const { matchId } = req.body;
+  if (!matchId || typeof matchId !== "string" || !matchId.trim()) {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+
+  try {
+    const { role } = await getPresenceRole(matchId.trim(), uid);
+    const inField  = role === "A" ? "playerAInMatchRoom" : "playerBInMatchRoom";
+    const hbField  = role === "A" ? "playerAHeartbeat"   : "playerBHeartbeat";
+
+    await db.collection("matches").doc(matchId.trim()).update({
+      [inField]: true,
+      [hbField]: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    console.log("[presence] enter matchId=" + matchId + " uid=" + uid + " role=" + role);
+    return res.json({ message: "Presence entered", role });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// POST /matches/presence/heartbeat
+app.post("/matches/presence/heartbeat", verifyToken, async (req, res) => {
+  const uid         = req.user.uid;
+  const { matchId } = req.body;
+  if (!matchId || typeof matchId !== "string" || !matchId.trim()) {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+
+  try {
+    const { role } = await getPresenceRole(matchId.trim(), uid);
+    const inField  = role === "A" ? "playerAInMatchRoom" : "playerBInMatchRoom";
+    const hbField  = role === "A" ? "playerAHeartbeat"   : "playerBHeartbeat";
+
+    await db.collection("matches").doc(matchId.trim()).update({
+      [inField]: true,
+      [hbField]: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.json({ message: "Heartbeat updated", role });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// POST /matches/presence/leave
+app.post("/matches/presence/leave", verifyToken, async (req, res) => {
+  const uid         = req.user.uid;
+  const { matchId } = req.body;
+  if (!matchId || typeof matchId !== "string" || !matchId.trim()) {
+    return res.status(400).json({ error: "matchId is required" });
+  }
+
+  try {
+    const { role } = await getPresenceRole(matchId.trim(), uid);
+    const inField  = role === "A" ? "playerAInMatchRoom" : "playerBInMatchRoom";
+
+    await db.collection("matches").doc(matchId.trim()).update({
+      [inField]: false,
+    });
+
+    console.log("[presence] leave matchId=" + matchId + " uid=" + uid + " role=" + role);
+    return res.json({ message: "Presence left", role });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+});
+
+// GET /matches/:matchId/presence  (optional non-realtime read)
+app.get("/matches/:matchId/presence", verifyToken, async (req, res) => {
+  try {
+    const matchDoc = await db.collection("matches").doc(req.params.matchId).get();
+    if (!matchDoc.exists) return res.status(404).json({ error: "Match not found" });
+
+    const d   = matchDoc.data();
+    const now = Date.now();
+
+    function computePresent(inRoom, hbTimestamp) {
+      if (!inRoom) return false;
+      if (!hbTimestamp) return false;
+      const ms = hbTimestamp._seconds
+        ? hbTimestamp._seconds * 1000
+        : hbTimestamp.toMillis ? hbTimestamp.toMillis() : 0;
+      return (now - ms) <= PRESENCE_STALE_MS;
+    }
+
+    return res.json({
+      playerA: {
+        uid:         d.playerA || null,
+        inMatchRoom: computePresent(d.playerAInMatchRoom, d.playerAHeartbeat),
+      },
+      playerB: {
+        uid:         d.playerB || null,
+        inMatchRoom: computePresent(d.playerBInMatchRoom, d.playerBHeartbeat),
+      },
+    });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
@@ -2345,7 +2550,6 @@ app.get("/user-exists/:uid", async (req, res) => {
 
 // =============================================================
 // MIGRATION: ENSURE BONUS COINS AND LAST SEEN
-// Sets bonusCoins = 0 if missing for existing users.
 // =============================================================
 app.post("/users/ensure-fields", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2382,7 +2586,7 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
       bonusCoins: updates.bonusCoins !== undefined ? updates.bonusCoins : data.bonusCoins,
       lastSeen:   updates.lastSeen !== undefined ? "set" : "already_present",
       removed:    [
-        data.bonusMatchUsed    !== undefined ? "bonusMatchUsed"    : null,
+        data.bonusMatchUsed      !== undefined ? "bonusMatchUsed"      : null,
         data.firstMatchBonusUsed !== undefined ? "firstMatchBonusUsed" : null,
       ].filter(Boolean),
     });
@@ -2465,7 +2669,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
 
     const patch = {};
 
-    // Ensure bonusCoins: existing users get 0 if missing.
     if (data.bonusCoins === undefined || data.bonusCoins === null) {
       patch.bonusCoins = 0;
     }
@@ -2690,6 +2893,8 @@ app.post("/matches/create", verifyToken, async (req, res) => {
         startedAt: null, matchStartedAt: null,
         rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null,
         autoResolved: false, autoCancelled: false, cancelReason: null,
+        playerAInMatchRoom: false, playerBInMatchRoom: false,
+        playerAHeartbeat:   null,  playerBHeartbeat:   null,
       });
     });
 
@@ -2927,6 +3132,8 @@ app.post("/matches/quick-match", verifyToken, async (req, res) => {
           startedAt: null, matchStartedAt: null,
           rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null,
           autoResolved: false, autoCancelled: false, cancelReason: null,
+          playerAInMatchRoom: false, playerBInMatchRoom: false,
+          playerAHeartbeat:   null,  playerBHeartbeat:   null,
         });
       });
       notifyMatchCreated(uid, matchId, gameUpper, entryFee, walletType).catch(() => {});
@@ -3046,7 +3253,6 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
       if (walletType === "bonus") {
         if (w === "draw") {
-          // UPDATED: Notify both players of bonus draw with 100% refund.
           const refund = bonusDrawRefund(entryFee);
           notifyBonusMatchDraw(matchSnapshot.playerA, matchId_, refund).catch(() => {});
           notifyBonusMatchDraw(matchSnapshot.playerB, matchId_, refund).catch(() => {});
@@ -3291,7 +3497,6 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
 
       if (walletType === "bonus") {
         if (w === "draw") {
-          // UPDATED: Bonus draw auto-resolve — 100% refund.
           const refund = bonusDrawRefund(entryFee);
           notifyBonusMatchDraw(matchSnapshot.playerA, matchId_, refund).catch(() => {});
           notifyBonusMatchDraw(matchSnapshot.playerB, matchId_, refund).catch(() => {});
@@ -3559,6 +3764,9 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
         rematchStatus: "accepted", rematchStartedAt: now,
         startedAt: now, matchStartedAt: now,
         players: [match.playerA, match.playerB],
+        // Reset presence for the new round
+        playerAInMatchRoom: false, playerBInMatchRoom: false,
+        playerAHeartbeat:   null,  playerBHeartbeat:   null,
       });
     });
 
@@ -3724,7 +3932,6 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
             fairPlayRating:        computeFairPlayRating(data),
             matchCompletionRate:   computeCompletionRate(data),
             rcBalance:             data.rcBalance             || 0,
-            // Existing users get bonusCoins = 0 if missing.
             bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
             firstPurchaseDone:     data.firstPurchaseDone     || false,
             referralRewardGranted: data.referralRewardGranted || false,
@@ -4087,24 +4294,12 @@ function startSystemNotificationsListener() {
 
 // =============================================================
 // ONLINE PLAYERS REFRESH LOOP
-//
-// Runs independently of matches, payments, or any other feature.
-// Every 60 seconds it recalculates how many users have a `lastSeen`
-// heartbeat within the last 5 minutes and writes that count to
-// platform/live_activity.onlinePlayers.
-//
-// Frontend apps must call POST /user/last-seen:
-//   - on app open
-//   - on app resume / foreground
-//   - on navigation within Duelix
-//   - on user actions
-//   - on a recurring 60-second heartbeat timer while active
 // =============================================================
 const ONLINE_REFRESH_INTERVAL_MS = 60 * 1000; // 60 seconds
 
 function startOnlinePlayersRefreshLoop() {
-  console.log("[online-refresh] Starting (interval=" + ONLINE_REFRESH_INTERVAL_MS + "ms, window=" + ONLINE_WINDOW_MS + "ms)");
-  // Run once immediately on boot, then on a fixed interval.
+  console.log("[online-refresh] Starting (interval=" + ONLINE_REFRESH_INTERVAL_MS +
+    "ms, window=" + ONLINE_WINDOW_MS + "ms)");
   refreshOnlinePlayersCount();
   setInterval(() => {
     refreshOnlinePlayersCount();
@@ -4120,6 +4315,7 @@ const server = app.listen(PORT, "0.0.0.0", () => {
   startRedemptionApprovalListener();
   startSystemNotificationsListener();
   startOnlinePlayersRefreshLoop();
+  startPresenceCleanupLoop();       // Match Room presence stale-cleanup
 });
 server.on("error", (err) => {
   console.error("Server error:", err.message);

@@ -1,3 +1,4 @@
+
 process.on("uncaughtException", (err) => {
   console.error("UNCAUGHT EXCEPTION:", err);
 });
@@ -56,6 +57,67 @@ app.use((_req, res, next) => {
 // =============================================================
 
 const inc = (current, by = 1) => (Number(current) || 0) + by;
+
+// =============================================================
+// PHONE → COUNTRY / CURRENCY DETECTION
+// =============================================================
+
+/**
+ * Ordered longest-prefix-first so more specific prefixes (e.g. +1868)
+ * are matched before shorter ones (e.g. +1).
+ * Add new countries here — no other code needs to change.
+ */
+const PHONE_COUNTRY_MAP = [
+  // Africa
+  { prefix: "+233", country: "Ghana",        currency: "GHS" },
+  { prefix: "+234", country: "Nigeria",      currency: "NGN" },
+  { prefix: "+254", country: "Kenya",        currency: "KES" },
+  { prefix: "+256", country: "Uganda",       currency: "UGX" },
+  { prefix: "+255", country: "Tanzania",     currency: "TZS" },
+  { prefix: "+27",  country: "South Africa", currency: "ZAR" },
+  { prefix: "+251", country: "Ethiopia",     currency: "ETB" },
+  { prefix: "+250", country: "Rwanda",       currency: "RWF" },
+  { prefix: "+237", country: "Cameroon",     currency: "XAF" },
+  { prefix: "+260", country: "Zambia",       currency: "ZMW" },
+  { prefix: "+263", country: "Zimbabwe",     currency: "ZWL" },
+  { prefix: "+225", country: "Ivory Coast",  currency: "XOF" },
+  { prefix: "+221", country: "Senegal",      currency: "XOF" },
+  { prefix: "+212", country: "Morocco",      currency: "MAD" },
+  { prefix: "+20",  country: "Egypt",        currency: "EGP" },
+  // Europe
+  { prefix: "+44",  country: "UK",           currency: "GBP" },
+  { prefix: "+49",  country: "Germany",      currency: "EUR" },
+  { prefix: "+33",  country: "France",       currency: "EUR" },
+  // Americas
+  { prefix: "+1",   country: "USA/Canada",   currency: "USD" },
+  { prefix: "+55",  country: "Brazil",       currency: "BRL" },
+  // Asia / Pacific
+  { prefix: "+91",  country: "India",        currency: "INR" },
+  { prefix: "+86",  country: "China",        currency: "CNY" },
+  { prefix: "+61",  country: "Australia",    currency: "AUD" },
+];
+
+// Sort longest prefix first to avoid shorter prefixes shadowing longer ones
+PHONE_COUNTRY_MAP.sort((a, b) => b.prefix.length - a.prefix.length);
+
+/**
+ * Detects country and currency from an E.164 phone number.
+ * Returns { country, currency }.
+ * Falls back to { country: "Unknown", currency: "Unknown" } with a console warning.
+ */
+function detectCountryFromPhone(phone) {
+  if (!phone || typeof phone !== "string") {
+    return { country: "Unknown", currency: "Unknown" };
+  }
+  const normalized = phone.trim();
+  for (const entry of PHONE_COUNTRY_MAP) {
+    if (normalized.startsWith(entry.prefix)) {
+      return { country: entry.country, currency: entry.currency };
+    }
+  }
+  console.warn("[detectCountryFromPhone] Unrecognised prefix for phone=" + normalized);
+  return { country: "Unknown", currency: "Unknown" };
+}
 
 // =============================================================
 // TRANSACTION RECORD HELPER
@@ -618,13 +680,8 @@ function startPresenceCleanupLoop() {
 // INVITE LINK HELPERS
 // =============================================================
 
-// Match invite expiry: 30 minutes from match creation.
 const INVITE_EXPIRY_MS = 30 * 60 * 1000;
 
-/**
- * Validates that a match is valid and still joinable via invite link.
- * Returns the match data if valid, throws a descriptive error if not.
- */
 async function validateInviteMatch(matchId) {
   const matchDoc = await db.collection("matches").doc(matchId).get();
   if (!matchDoc.exists) throw new Error("Match not found");
@@ -636,7 +693,6 @@ async function validateInviteMatch(matchId) {
   if (match.status !== "waiting")   throw new Error("This match is no longer accepting players");
   if (match.playerB != null)        throw new Error("This match is already full");
 
-  // Check expiry from createdAt
   const createdAt = match.createdAt;
   if (createdAt) {
     const createdMs = createdAt._seconds
@@ -866,7 +922,7 @@ function notificationFilterTag(type) {
     "coins_added", "reward_payout", "coin_purchase",
     "purchase_successful", "redeem_successful", "rc_earned",
     "redemption_requested", "redemption_approved", "redemption_rejected",
-    "reward",
+    "reward", "rc_converted",
   ];
   const socialTypes   = ["friend_request", "friend_accepted", "chat_message"];
   const referralTypes = ["referral", "referral_reward"];
@@ -1124,6 +1180,14 @@ function notifyRedemptionRequested(userId, rcAmount, usdValue) {
     "Your request to redeem " + rcAmount + " RC ($" +
       usdValue.toFixed(2) + ") has been received. Allow 1-3 business days.",
     { rcAmount, usdValue }
+  );
+}
+
+function notifyRcConverted(userId, rcAmount, coinsAdded) {
+  return notifyUser(
+    userId, "rc_converted", "RC Converted to Coins!",
+    "Successfully converted " + rcAmount + " RC into " + coinsAdded + " Gameplay Coins.",
+    { rcAmount, coinsAdded }
   );
 }
 
@@ -1520,26 +1584,8 @@ app.get("/matches/:matchId/presence", verifyToken, async (req, res) => {
 
 // =============================================================
 // INVITE SYSTEM
-//
-// GET  /api/matches/:matchId/invite
-//   Public-safe invite info endpoint — called by the app when
-//   an invited user opens a deep link. Does NOT require auth so
-//   that the user can preview the match before logging in.
-//   Returns only non-sensitive fields (no balances, no UIDs).
-//
-// POST /matches/join-by-invite
-//   Authenticated join via invite link. Validates everything
-//   server-side, uses a Firestore transaction to prevent race
-//   conditions, and locks the match on success.
 // =============================================================
 
-/**
- * GET /api/matches/:matchId/invite
- *
- * Returns invite-safe match info for the Join Match Card.
- * No auth required (invite links are public-safe).
- * Security: only exposes approved fields, never coins/UIDs.
- */
 app.get("/api/matches/:matchId/invite", async (req, res) => {
   const { matchId } = req.params;
 
@@ -1550,7 +1596,6 @@ app.get("/api/matches/:matchId/invite", async (req, res) => {
   try {
     const match = await validateInviteMatch(matchId.trim());
 
-    // Fetch host username and trust score (non-sensitive)
     const hostDoc = await db.collection("users").doc(match.playerA).get();
     const hostData = hostDoc.exists ? hostDoc.data() : {};
 
@@ -1578,10 +1623,9 @@ app.get("/api/matches/:matchId/invite", async (req, res) => {
       hostTrustScore,
       hostAvatar,
       status:       match.status,
-      inviteEnabled: match.inviteEnabled !== false, // default true
+      inviteEnabled: match.inviteEnabled !== false,
     });
   } catch (err) {
-    // Map to appropriate HTTP status
     if (
       err.message === "Match not found" ||
       err.message.includes("cancelled") ||
@@ -1596,15 +1640,6 @@ app.get("/api/matches/:matchId/invite", async (req, res) => {
   }
 });
 
-/**
- * POST /matches/join-by-invite
- *
- * Authenticated endpoint. Joins a match via invite deep link.
- * Uses Firestore transaction to prevent double-joins and race
- * conditions. All validation happens server-side.
- *
- * Body: { matchId }
- */
 app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   const uid         = req.user.uid;
@@ -1615,7 +1650,6 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
 
   const safeMatchId = matchId.trim();
 
-  // Check that the user is not already in another active match
   try {
     const activeSnap = await db.collection("matches")
       .where("status", "in", ["waiting", "active"])
@@ -1623,7 +1657,6 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
       .limit(1)
       .get();
 
-    // Allow if the only active match is this one (they created it somehow)
     const otherActive = activeSnap.docs.filter((d) => d.id !== safeMatchId);
     if (otherActive.length > 0) {
       return res.status(400).json({
@@ -1632,7 +1665,6 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
     }
   } catch (err) {
     console.error("[join-by-invite] active match check:", err.message);
-    // Non-fatal: proceed with transaction which will catch this too.
   }
 
   try {
@@ -1654,13 +1686,11 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
       const userData   = userDoc.data();
       const walletType = validateWalletType(match.walletType);
 
-      // --- Server-side validations (all inside transaction) ---
       if (match.playerA === uid)  throw new Error("You cannot join your own match");
       if (match.playerB != null)  throw new Error("This match is already full");
       if (match.status !== "waiting") throw new Error("This match is no longer available");
       if (match.inviteEnabled === false) throw new Error("Invites are disabled for this match");
 
-      // Check invite expiry inside transaction
       const createdAt = match.createdAt;
       if (createdAt) {
         const createdMs = createdAt._seconds
@@ -1671,7 +1701,6 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
         }
       }
 
-      // Balance check
       if (walletType === "bonus") {
         const bonusCoins = userData.bonusCoins != null ? Number(userData.bonusCoins) : 0;
         if (bonusCoins < match.entryFee) throw new Error("Insufficient Bonus Coins to join this match");
@@ -1697,7 +1726,6 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
         matchStartedAt: now,
         joinedAt:       now,
         joinedViaInvite: true,
-        // Disable further invites once someone has joined
         inviteEnabled:  false,
       });
 
@@ -1715,13 +1743,11 @@ app.post("/matches/join-by-invite", verifyToken, async (req, res) => {
       };
     });
 
-    // Fetch host username for notification (outside transaction)
     try {
       const hostDoc = await db.collection("users").doc(hostUid).get();
       hostUsername = hostDoc.exists ? (hostDoc.data().displayName || "Host") : "Host";
     } catch (_) {}
 
-    // Notify both players
     notifyInviteJoined(hostUid, joinerUsername, safeMatchId, joinedMatch.game).catch(() => {});
     notifyMatchStarted(hostUid, uid, safeMatchId, joinedMatch.game).catch(() => {});
 
@@ -1938,6 +1964,96 @@ app.post("/rc/redeem", verifyToken, async (req, res) => {
 });
 
 // =============================================================
+// RC CONVERT TO GAMEPLAY COINS
+// =============================================================
+app.post("/rc/convert", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { rcAmount } = req.body;
+
+  if (rcAmount === null || rcAmount === undefined) {
+    return res.status(400).json({ error: "rcAmount is required" });
+  }
+  if (typeof rcAmount !== "number") {
+    return res.status(400).json({ error: "rcAmount must be a number" });
+  }
+  if (!Number.isInteger(rcAmount)) {
+    return res.status(400).json({ error: "rcAmount must be a whole integer — no decimals allowed" });
+  }
+  if (rcAmount < 5) {
+    return res.status(400).json({ error: "Minimum conversion is 5 RC" });
+  }
+  if (rcAmount <= 0) {
+    return res.status(400).json({ error: "rcAmount must be a positive integer" });
+  }
+
+  try {
+    let newRcBalance    = 0;
+    let newCoinBalance  = 0;
+    const coinsToCredit = rcAmount;
+
+    await db.runTransaction(async (t) => {
+      const userRef = db.collection("users").doc(uid);
+      const userDoc = await t.get(userRef);
+
+      if (!userDoc.exists) throw new Error("User not found");
+
+      const userData   = userDoc.data();
+      const currentRc  = Number(userData.rcBalance) || 0;
+      const currentCns = Number(userData.coins)     || 0;
+
+      if (rcAmount > currentRc) {
+        throw new Error("Insufficient RC balance. You have " + currentRc + " RC.");
+      }
+
+      newRcBalance   = currentRc  - rcAmount;
+      newCoinBalance = currentCns + coinsToCredit;
+
+      t.update(userRef, {
+        rcBalance:  newRcBalance,
+        coins:      newCoinBalance,
+        updatedAt:  admin.firestore.FieldValue.serverTimestamp(),
+      });
+
+      const txRef = db.collection("transactions").doc();
+      t.set(txRef, {
+        id:          txRef.id,
+        userId:      uid,
+        type:        "rc_converted",
+        amount:      coinsToCredit,
+        description: "Converted " + rcAmount + " RC into " + coinsToCredit + " Gameplay Coins",
+        status:      "completed",
+        rcDeducted:  rcAmount,
+        coinsAdded:  coinsToCredit,
+        newRcBalance,
+        newCoinBalance,
+        createdAt:   admin.firestore.FieldValue.serverTimestamp(),
+      });
+    });
+
+    notifyRcConverted(uid, rcAmount, coinsToCredit).catch(() => {});
+
+    console.log("[rc/convert] uid=" + uid + " rcAmount=" + rcAmount + " coinsAdded=" + coinsToCredit + " newRcBalance=" + newRcBalance + " newCoinBalance=" + newCoinBalance);
+
+    return res.json({
+      message:        "Successfully converted " + rcAmount + " RC into " + coinsToCredit + " Gameplay Coins.",
+      rcDeducted:     rcAmount,
+      coinsAdded:     coinsToCredit,
+      newRcBalance,
+      newCoinBalance,
+    });
+  } catch (err) {
+    if (err.message.startsWith("Insufficient RC")) {
+      return res.status(400).json({ error: err.message });
+    }
+    if (err.message === "User not found") {
+      return res.status(404).json({ error: err.message });
+    }
+    console.error("[rc/convert] uid=" + uid + " error=" + err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// =============================================================
 // RC HISTORY
 // =============================================================
 app.get("/rc/history", verifyToken, async (req, res) => {
@@ -2037,7 +2153,7 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 });
 
 // =============================================================
-// CREATE USER PROFILE
+// CREATE USER PROFILE  ← country/currency auto-detected here
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2047,6 +2163,11 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
   const name = displayName.trim();
   if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
   const ipAddress = req.headers["x-forwarded-for"] ? String(req.headers["x-forwarded-for"]).split(",")[0].trim() : req.socket.remoteAddress || null;
+
+  // Detect country and currency from the phone number
+  const { country, currency } = detectCountryFromPhone(phone);
+  console.log("[create-profile] uid=" + uid + " phone=" + phone + " country=" + country + " currency=" + currency);
+
   try {
     if (ipAddress && (await isIpAbusive(ipAddress))) return res.status(429).json({ error: "Too many accounts registered from this network." });
     const deviceCount = await countAccountsByDevice(deviceId, installId);
@@ -2060,11 +2181,23 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
       if (snap.exists) return;
-      t.set(userRef, Object.assign({ uid, displayName: name, phone, email: email != null ? email : "", coins: 0, bonusCoins: 10, wins: 0, losses: 0, draws: 0, totalMatches: 0, loginStreak: 0, lastLogin: null, lastSeen: admin.firestore.FieldValue.serverTimestamp(), avatar: "assets/avatars/avatar1.png", referralCode, referredBy: null, referredByName: null, referralCount: 0, referralRewardGranted: false, firstPurchaseDone: false, fcmToken: null, deviceId: deviceId || null, installId: installId || null, createdAt: admin.firestore.FieldValue.serverTimestamp() }, DEFAULT_TRUST_FIELDS));
+      t.set(userRef, Object.assign({
+        uid, displayName: name, phone, email: email != null ? email : "",
+        country,    // ← new
+        currency,   // ← new
+        coins: 0, bonusCoins: 10, wins: 0, losses: 0, draws: 0, totalMatches: 0,
+        loginStreak: 0, lastLogin: null,
+        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
+        avatar: "assets/avatars/avatar1.png",
+        referralCode, referredBy: null, referredByName: null,
+        referralCount: 0, referralRewardGranted: false, firstPurchaseDone: false,
+        fcmToken: null, deviceId: deviceId || null, installId: installId || null,
+        createdAt: admin.firestore.FieldValue.serverTimestamp(),
+      }, DEFAULT_TRUST_FIELDS));
     });
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
     notifyUser(uid, "system", "Welcome to Duelix!", "Your account is ready! You have 10 bonus coins to start. Play and win to earn more!", {}).catch(() => {});
-    return res.status(201).json({ message: "Profile created", uid, referralCode });
+    return res.status(201).json({ message: "Profile created", uid, referralCode, country, currency });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
@@ -2090,8 +2223,26 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
     if (!data.lastSeen) updates.lastSeen = admin.firestore.FieldValue.serverTimestamp();
     if (data.bonusMatchUsed !== undefined)      updates.bonusMatchUsed = admin.firestore.FieldValue.delete();
     if (data.firstMatchBonusUsed !== undefined) updates.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+
+    // Backfill country/currency if missing
+    if (!data.country || !data.currency) {
+      const detected = detectCountryFromPhone(data.phone || "");
+      if (!data.country)  updates.country  = detected.country;
+      if (!data.currency) updates.currency = detected.currency;
+    }
+
     if (Object.keys(updates).length > 0) await userRef.set(updates, { merge: true });
-    return res.json({ message: "Fields ensured", bonusCoins: updates.bonusCoins !== undefined ? updates.bonusCoins : data.bonusCoins, lastSeen: updates.lastSeen !== undefined ? "set" : "already_present", removed: [data.bonusMatchUsed !== undefined ? "bonusMatchUsed" : null, data.firstMatchBonusUsed !== undefined ? "firstMatchBonusUsed" : null].filter(Boolean) });
+    return res.json({
+      message:    "Fields ensured",
+      bonusCoins: updates.bonusCoins !== undefined ? updates.bonusCoins : data.bonusCoins,
+      lastSeen:   updates.lastSeen   !== undefined ? "set" : "already_present",
+      country:    updates.country    || data.country,
+      currency:   updates.currency   || data.currency,
+      removed:    [
+        data.bonusMatchUsed      !== undefined ? "bonusMatchUsed"      : null,
+        data.firstMatchBonusUsed !== undefined ? "firstMatchBonusUsed" : null,
+      ].filter(Boolean),
+    });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
@@ -2138,17 +2289,47 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     if (!data.lastSeen) patch.lastSeen = admin.firestore.FieldValue.serverTimestamp();
     if (data.bonusMatchUsed !== undefined)      patch.bonusMatchUsed = admin.firestore.FieldValue.delete();
     if (data.firstMatchBonusUsed !== undefined) patch.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+
+    // Backfill country/currency on read if missing
+    if (!data.country || !data.currency) {
+      const detected = detectCountryFromPhone(data.phone || "");
+      if (!data.country)  patch.country  = detected.country;
+      if (!data.currency) patch.currency = detected.currency;
+    }
+
     if (data.trustScore === undefined) {
-      const trustFields = { trustScore: 80, completedMatches: data.completedMatches || 0, cancelledMatches: data.cancelledMatches || 0, disputesLost: data.disputesLost || 0, reportsReceived: data.reportsReceived || 0, fakeResults: data.fakeResults || 0, rageQuits: data.rageQuits || 0, fairPlayRating: 100, matchCompletionRate: 0, cleanMatchBonus: 0, fairPlayBonus: 0, rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, onlineStatus: data.onlineStatus !== undefined ? data.onlineStatus : true, friendRequests: data.friendRequests !== undefined ? data.friendRequests : true };
+      const trustFields = {
+        trustScore: 80, completedMatches: data.completedMatches || 0,
+        cancelledMatches: data.cancelledMatches || 0, disputesLost: data.disputesLost || 0,
+        reportsReceived: data.reportsReceived || 0, fakeResults: data.fakeResults || 0,
+        rageQuits: data.rageQuits || 0, fairPlayRating: 100, matchCompletionRate: 0,
+        cleanMatchBonus: 0, fairPlayBonus: 0, rcBalance: data.rcBalance || 0,
+        bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0,
+        firstPurchaseDone: data.firstPurchaseDone || false,
+        referralRewardGranted: data.referralRewardGranted || false,
+        onlineStatus: data.onlineStatus !== undefined ? data.onlineStatus : true,
+        friendRequests: data.friendRequests !== undefined ? data.friendRequests : true,
+        country:  patch.country  || data.country  || "Unknown",
+        currency: patch.currency || data.currency || "Unknown",
+      };
       Object.assign(trustFields, patch);
       db.collection("users").doc(req.params.uid).set(Object.assign({}, trustFields, patch), { merge: true }).catch(() => {});
       const result = Object.assign({}, data, trustFields);
       delete result.bonusMatchUsed; delete result.firstMatchBonusUsed;
       return res.json(result);
     }
-    const needsPatch = data.cleanMatchBonus === undefined || data.fairPlayBonus === undefined || data.rcBalance === undefined || data.bonusCoins === undefined || data.firstPurchaseDone === undefined || data.referralRewardGranted === undefined || !data.lastSeen || data.bonusMatchUsed !== undefined || data.firstMatchBonusUsed !== undefined;
+    const needsPatch = data.cleanMatchBonus === undefined || data.fairPlayBonus === undefined ||
+      data.rcBalance === undefined || data.bonusCoins === undefined ||
+      data.firstPurchaseDone === undefined || data.referralRewardGranted === undefined ||
+      !data.lastSeen || !data.country || !data.currency ||
+      data.bonusMatchUsed !== undefined || data.firstMatchBonusUsed !== undefined;
     if (needsPatch || Object.keys(patch).length > 0) {
-      const fullPatch = Object.assign({ cleanMatchBonus: data.cleanMatchBonus || 0, fairPlayBonus: data.fairPlayBonus || 0, rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false }, patch);
+      const fullPatch = Object.assign({
+        cleanMatchBonus: data.cleanMatchBonus || 0, fairPlayBonus: data.fairPlayBonus || 0,
+        rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0,
+        firstPurchaseDone: data.firstPurchaseDone || false,
+        referralRewardGranted: data.referralRewardGranted || false,
+      }, patch);
       db.collection("users").doc(req.params.uid).set(fullPatch, { merge: true }).catch(() => {});
       const result = Object.assign({}, data, fullPatch);
       delete result.bonusMatchUsed; delete result.firstMatchBonusUsed;
@@ -2780,7 +2961,7 @@ app.get("/leaderboard", verifyToken, async (req, res) => {
 });
 
 // =============================================================
-// ADMIN -- TRUST + FIELD MIGRATION
+// ADMIN -- TRUST + FIELD MIGRATION  ← country/currency added
 // =============================================================
 app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
   let migrated = 0, errors = 0;
@@ -2794,9 +2975,22 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       snap.docs.forEach((doc) => {
         try {
           const data = doc.data();
-          const updateFields = { trustScore: computeTrustScore(data), fairPlayRating: computeFairPlayRating(data), matchCompletionRate: computeCompletionRate(data), rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() };
-          if (!data.lastSeen) updateFields.lastSeen = admin.firestore.FieldValue.serverTimestamp();
-          if (data.bonusMatchUsed !== undefined) updateFields.bonusMatchUsed = admin.firestore.FieldValue.delete();
+          const detected = detectCountryFromPhone(data.phone || "");
+          const updateFields = {
+            trustScore:            computeTrustScore(data),
+            fairPlayRating:        computeFairPlayRating(data),
+            matchCompletionRate:   computeCompletionRate(data),
+            rcBalance:             data.rcBalance             || 0,
+            bonusCoins:            data.bonusCoins != null    ? data.bonusCoins : 0,
+            firstPurchaseDone:     data.firstPurchaseDone     || false,
+            referralRewardGranted: data.referralRewardGranted || false,
+            trustUpdatedAt:        admin.firestore.FieldValue.serverTimestamp(),
+            // Only set country/currency if currently missing
+            ...(!data.country  ? { country:  detected.country  } : {}),
+            ...(!data.currency ? { currency: detected.currency } : {}),
+          };
+          if (!data.lastSeen)                    updateFields.lastSeen          = admin.firestore.FieldValue.serverTimestamp();
+          if (data.bonusMatchUsed !== undefined)  updateFields.bonusMatchUsed    = admin.firestore.FieldValue.delete();
           if (data.firstMatchBonusUsed !== undefined) updateFields.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
           batch.set(doc.ref, updateFields, { merge: true });
           migrated++;
@@ -2808,6 +3002,67 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
     }
     return res.json({ message: "Trust migration complete", migrated, errors });
   } catch (err) { return res.status(500).json({ error: err.message, migrated, errors }); }
+});
+
+// =============================================================
+// ADMIN -- COUNTRY/CURRENCY MIGRATION (standalone)
+// =============================================================
+// POST /admin/migrate-country-currency
+//
+// Iterates every user doc, detects country/currency from phone,
+// and writes the fields only when they are currently missing.
+// Existing valid values are never overwritten.
+// Returns { migrated, skipped, errors } for visibility.
+// =============================================================
+app.post("/admin/migrate-country-currency", verifyToken, async (req, res) => {
+  let migrated = 0, skipped = 0, errors = 0;
+  try {
+    const PAGE = 100;
+    let lastDoc = null, hasMore = true;
+
+    while (hasMore) {
+      let query = db.collection("users").limit(PAGE);
+      if (lastDoc) query = query.startAfter(lastDoc);
+      const snap = await query.get();
+
+      if (snap.empty) { hasMore = false; break; }
+
+      const batch = db.batch();
+      let batchWrites = 0;
+
+      snap.docs.forEach((doc) => {
+        try {
+          const data = doc.data();
+          const needsCountry  = !data.country  || data.country  === "Unknown";
+          const needsCurrency = !data.currency || data.currency === "Unknown";
+
+          if (!needsCountry && !needsCurrency) { skipped++; return; }
+
+          const detected = detectCountryFromPhone(data.phone || "");
+          const patch    = {};
+          if (needsCountry)  patch.country  = detected.country;
+          if (needsCurrency) patch.currency = detected.currency;
+
+          batch.set(doc.ref, patch, { merge: true });
+          batchWrites++;
+          migrated++;
+        } catch (e) {
+          console.error("[migrate-country-currency] uid=" + doc.id + " err=" + e.message);
+          errors++;
+        }
+      });
+
+      if (batchWrites > 0) await batch.commit();
+
+      lastDoc = snap.docs[snap.docs.length - 1];
+      hasMore = snap.docs.length === PAGE;
+    }
+
+    console.log("[migrate-country-currency] migrated=" + migrated + " skipped=" + skipped + " errors=" + errors);
+    return res.json({ message: "Country/currency migration complete", migrated, skipped, errors });
+  } catch (err) {
+    return res.status(500).json({ error: err.message, migrated, skipped, errors });
+  }
 });
 
 app.post("/matches/timer-alert", verifyToken, async (req, res) => {

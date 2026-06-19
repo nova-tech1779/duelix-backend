@@ -315,8 +315,11 @@ const DEFAULT_TRUST_FIELDS = {
   rcBalance:           0,
   strikeCount:         0,
   isBanned:            false,
+  banType:             null,
+  banHours:            null,
   banReason:           "",
   bannedAt:            null,
+  banExpiresAt:        null,
 };
 
 function applyTrustUpdate(t, userRef, userData) {

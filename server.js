@@ -2200,13 +2200,16 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       const now           = admin.firestore.FieldValue.serverTimestamp();
       const disputeDeadline = new Date(Date.now() + DISPUTE_EXPIRY_MS);
 
-      // Store all required dispute fields including evidence URLs per player
+      // Store all required dispute fields including evidence URLs per player.
+      // The player who CREATED the dispute (uid) has their evidence saved
+      // immediately here. The OTHER player's fields stay empty until they
+      // submit via /matches/dispute/submit-opponent-evidence.
       t.set(disputeRef, {
         id:               disputeId,
         matchId,
         playerA:          match.playerA,
         playerB:          match.playerB,
-        // Opener fields
+        // Opener fields (the player who filed the dispute)
         playerAReason:    match.playerA === uid ? validatedReason  : "",
         playerAComment:   match.playerA === uid ? validatedNote    : "",
         playerAEvidenceUrl: match.playerA === uid ? (validatedEvidence || "") : "",
@@ -2254,10 +2257,11 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       });
     });
 
-    // Notify the player who opened the dispute
+    // Notify the player who opened the dispute — their evidence is already
+    // saved at this point, so they do NOT need to upload again.
     notifyEvidenceSubmitted(uid, matchId).catch(() => {});
 
-    // Notify opponent — they need to submit evidence
+    // Notify opponent — they need to submit evidence (the disputer does not)
     if (opponentUid) {
       notifyUser(opponentUid, "match_dispute_opened", "Dispute Filed",
         "Your opponent has disputed the match. Please submit your evidence within 5 minutes.",
@@ -2344,9 +2348,10 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
 
 // =============================================================
 // OPPONENT EVIDENCE SUBMISSION
-// Called when the opponent submits their evidence from the match
-// room after a dispute has been opened against them.
-// Updates the existing dispute document with playerB fields.
+// Called when the opponent (the player who did NOT file the dispute)
+// submits their evidence from the match room after a dispute has
+// been opened against them. Updates the existing dispute document
+// with that player's fields only.
 // =============================================================
 app.post("/matches/dispute/submit-opponent-evidence", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2384,6 +2389,13 @@ app.post("/matches/dispute/submit-opponent-evidence", verifyToken, async (req, r
 
     if (disputeData.status !== "pending") {
       return res.status(400).json({ error: "Evidence window has closed" });
+    }
+
+    // Reject if the caller is the player who created the dispute — they
+    // already submitted evidence at creation time and must not be asked
+    // (or allowed) to submit a second time through this endpoint.
+    if (disputeData.disputedBy === uid) {
+      return res.status(400).json({ error: "You already submitted evidence when you filed this dispute" });
     }
 
     // Check deadline

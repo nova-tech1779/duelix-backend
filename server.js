@@ -352,6 +352,12 @@ function applyCleanMatchReward(t, userRef, userData) {
 
 // =============================================================
 // STRIKE SYSTEM
+// Updated enforcement rules:
+//   Strike 1 -> Warning only
+//   Strike 2 -> Warning only
+//   Strike 3 -> 12 Hour Ban
+//   Strike 4 -> 24 Hour Ban
+//   Strike 5 -> Permanent Ban
 // =============================================================
 
 async function applyStrike(uid, reason) {
@@ -375,35 +381,78 @@ async function applyStrike(uid, reason) {
       trustUpdatedAt:      admin.firestore.FieldValue.serverTimestamp(),
     };
 
-    if (newStrikes === 2) {
-      // 24-hour temporary ban — store all required ban fields
-      const bannedAt      = admin.firestore.FieldValue.serverTimestamp();
-      const banExpiresAt  = new Date(Date.now() + 24 * 60 * 60 * 1000);
+    if (newStrikes === 1) {
+      // Strike 1 — Warning only, no ban
+      notifyUser(
+        uid,
+        "strike_warning",
+        "Strike Warning — 1 of 5",
+        "Warning 1 of 5: " + reason + ". Continued abuse may result in suspension.",
+        { strikeCount: newStrikes, reason }
+      ).catch(() => {});
+
+    } else if (newStrikes === 2) {
+      // Strike 2 — Warning only, no ban
+      notifyUser(
+        uid,
+        "strike_warning",
+        "Strike Warning — 2 of 5",
+        "Warning 2 of 5: " + reason + ". Further violations will result in account suspension.",
+        { strikeCount: newStrikes, reason }
+      ).catch(() => {});
+
+    } else if (newStrikes === 3) {
+      // Strike 3 — 12 Hour Ban
+      const bannedAt     = admin.firestore.FieldValue.serverTimestamp();
+      const banExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
+      updateFields.isBanned      = true;
+      updateFields.banReason     = "12 Hour Suspension";
+      updateFields.banCreatedAt  = bannedAt;
+      updateFields.banTimestamp  = bannedAt;
+      updateFields.banExpiresAt  = admin.firestore.Timestamp.fromDate(banExpiresAt);
+      updateFields.bannedAt      = bannedAt;
+      notifyUser(
+        uid,
+        "account_suspended_24h",
+        "Account Suspended — 12 Hours",
+        "You have received Strike 3. Your account is suspended for 12 hours due to repeated violations.",
+        { strikeCount: newStrikes, banReason: "12 Hour Suspension" }
+      ).catch(() => {});
+
+    } else if (newStrikes === 4) {
+      // Strike 4 — 24 Hour Ban
+      const bannedAt     = admin.firestore.FieldValue.serverTimestamp();
+      const banExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
       updateFields.isBanned      = true;
       updateFields.banReason     = "24 Hour Suspension";
       updateFields.banCreatedAt  = bannedAt;
       updateFields.banTimestamp  = bannedAt;
       updateFields.banExpiresAt  = admin.firestore.Timestamp.fromDate(banExpiresAt);
       updateFields.bannedAt      = bannedAt;
-      notifyUser(uid, "account_suspended_24h", "Account Suspended — 24 Hours",
-        "You have received Strike 2. Your account is suspended for 24 hours due to dispute abuse.",
-        { strikeCount: newStrikes, banReason: "24 Hour Suspension" }).catch(() => {});
-    } else if (newStrikes >= 3) {
-      // Permanent ban — no banExpiresAt, no countdown
-      const bannedAt     = admin.firestore.FieldValue.serverTimestamp();
+      notifyUser(
+        uid,
+        "account_suspended_24h",
+        "Account Suspended — 24 Hours",
+        "You have received Strike 4. Your account is suspended for 24 hours. One more violation will result in a permanent ban.",
+        { strikeCount: newStrikes, banReason: "24 Hour Suspension" }
+      ).catch(() => {});
+
+    } else if (newStrikes >= 5) {
+      // Strike 5+ — Permanent Ban
+      const bannedAt = admin.firestore.FieldValue.serverTimestamp();
       updateFields.isBanned     = true;
       updateFields.banReason    = "Permanent Suspension";
       updateFields.banCreatedAt = bannedAt;
       updateFields.banTimestamp = bannedAt;
       updateFields.bannedAt     = bannedAt;
-      notifyUser(uid, "account_banned", "Account Permanently Restricted",
-        "Strike 3 received. Your account has been permanently restricted. Please use the appeal form.",
-        { strikeCount: newStrikes, banReason: "Permanent Suspension" }).catch(() => {});
-    } else {
-      // Strike 1 warning
-      notifyUser(uid, "strike_warning", "Strike Warning — " + newStrikes + " of 3",
-        "Warning " + newStrikes + " of 3: " + reason + ". Future abuse may result in suspension.",
-        { strikeCount: newStrikes, reason }).catch(() => {});
+      // No banExpiresAt for permanent bans
+      notifyUser(
+        uid,
+        "account_banned",
+        "Account Permanently Restricted",
+        "Strike 5 received. Your account has been permanently restricted. Please use the appeal form.",
+        { strikeCount: newStrikes, banReason: "Permanent Suspension" }
+      ).catch(() => {});
     }
 
     await userRef.update(updateFields);
@@ -878,13 +927,30 @@ function notifyDisputeRefund(userId, matchId, coinsRefunded) {
   return notifyUser(userId, "dispute_refund", "Dispute Refund", "Both players have been refunded +" + coinsRefunded + " coins after dispute review.", { matchId, coinsRefunded });
 }
 function notifyStrikeWarning(userId, strikeCount, reason) {
+  // Updated to reflect new 5-strike system
   const msgs = {
-    1: "Warning 1 of 3: " + reason + ". Future abuse may result in suspension.",
-    2: "Strike 2 of 3: Your account is suspended for 24 hours. Repeated abuse leads to a permanent ban.",
-    3: "Strike 3: Your account has been permanently restricted. Please appeal via the app.",
+    1: "Warning 1 of 5: " + reason + ". Future abuse may result in suspension.",
+    2: "Warning 2 of 5: " + reason + ". Further violations will result in account suspension.",
+    3: "Strike 3 of 5: Your account is suspended for 12 hours. Repeated abuse leads to longer bans.",
+    4: "Strike 4 of 5: Your account is suspended for 24 hours. One more violation will result in a permanent ban.",
+    5: "Strike 5: Your account has been permanently restricted. Please appeal via the app.",
   };
-  const titles = { 1: "Strike Warning — 1 of 3", 2: "Account Suspended 24h — Strike 2", 3: "Account Permanently Restricted" };
-  return notifyUser(userId, strikeCount >= 3 ? "account_banned" : strikeCount === 2 ? "account_suspended_24h" : "strike_warning", titles[Math.min(strikeCount, 3)] || "Strike Warning", msgs[Math.min(strikeCount, 3)] || reason, { strikeCount, reason });
+  const titles = {
+    1: "Strike Warning — 1 of 5",
+    2: "Strike Warning — 2 of 5",
+    3: "Account Suspended 12h — Strike 3",
+    4: "Account Suspended 24h — Strike 4",
+    5: "Account Permanently Restricted",
+  };
+  const clampedCount = Math.min(strikeCount, 5);
+  const notifType = clampedCount >= 5 ? "account_banned" : clampedCount >= 3 ? "account_suspended_24h" : "strike_warning";
+  return notifyUser(
+    userId,
+    notifType,
+    titles[clampedCount] || "Strike Warning",
+    msgs[clampedCount] || reason,
+    { strikeCount, reason }
+  );
 }
 function notifyEvidenceRequired(userId, matchId, deadline) {
   return notifyUser(userId, "dispute_evidence_required", "Evidence Required", "A dispute has been opened for your match. Submit your evidence within 5 minutes.", { matchId, deadline });
@@ -1120,6 +1186,7 @@ app.get("/health", (_req, res) => res.json({ status: "ok" }));
 // =============================================================
 // BAN CHECK ENDPOINT
 // Called on every login from Flutter to detect suspended accounts.
+// Handles both 12-hour and 24-hour temporary bans.
 // =============================================================
 app.post("/user/check-ban", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1129,16 +1196,19 @@ app.post("/user/check-ban", verifyToken, async (req, res) => {
     const data = userDoc.data();
     if (!data.isBanned) return res.json({ isBanned: false });
 
-    // Auto-lift temporary bans when banExpiresAt is reached
-    if (data.banReason === "24 Hour Suspension") {
-      // Check banExpiresAt first (preferred), fallback to bannedAt + 24h
+    // Auto-lift temporary bans (12 Hour or 24 Hour) when banExpiresAt is reached
+    if (data.banReason === "12 Hour Suspension" || data.banReason === "24 Hour Suspension") {
       let expired = false;
       if (data.banExpiresAt) {
         const expiresMs = data.banExpiresAt._seconds ? data.banExpiresAt._seconds * 1000 : data.banExpiresAt.toMillis ? data.banExpiresAt.toMillis() : 0;
         expired = expiresMs > 0 && Date.now() >= expiresMs;
       } else if (data.bannedAt) {
+        // Fallback: derive expiry from ban reason
         const bannedMs = data.bannedAt._seconds ? data.bannedAt._seconds * 1000 : data.bannedAt.toMillis ? data.bannedAt.toMillis() : 0;
-        expired = bannedMs > 0 && (Date.now() - bannedMs) > 24 * 60 * 60 * 1000;
+        const durationMs = data.banReason === "12 Hour Suspension"
+          ? 12 * 60 * 60 * 1000
+          : 24 * 60 * 60 * 1000;
+        expired = bannedMs > 0 && (Date.now() - bannedMs) > durationMs;
       }
       if (expired) {
         await db.collection("users").doc(uid).update({
@@ -1213,11 +1283,18 @@ app.get("/platform/live-activity", verifyToken, async (req, res) => {
 });
 
 // =============================================================
-// CLOUDINARY -- SECURE UPLOAD ENDPOINT
-// Flutter sends base64 image data; server uploads to Cloudinary
-// and returns only the secure_url. API secret never leaves server.
-// Used both during initial dispute creation and by the opponent
-// when submitting their own evidence from the match room.
+// CLOUDINARY -- SECURE EVIDENCE UPLOAD ENDPOINT
+//
+// REQUIRED FLOW (enforced here):
+//   1. Validate the request (matchId, imageBase64).
+//   2. Verify the caller is in the match.
+//   3. FIND or verify the existing dispute document for this match.
+//      -- If no dispute document exists yet, return a controlled error.
+//      -- Cloudinary upload NEVER starts before a dispute record exists.
+//   4. Upload evidence to Cloudinary using disputeId as the reference.
+//   5. Attach the returned URL to the existing dispute document.
+//
+// All uploads are renamed to "disputes_evidence" folder prefix.
 // =============================================================
 app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1232,36 +1309,80 @@ app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
     ? mimeType
     : "image/jpeg";
 
+  const safeMatchId = matchId.trim();
+
   try {
-    const matchDoc = await db.collection("matches").doc(matchId.trim()).get();
+    // Step 1: Verify match exists and caller is a participant
+    const matchDoc = await db.collection("matches").doc(safeMatchId).get();
     if (!matchDoc.exists) return res.status(404).json({ error: "Match not found" });
     const match = matchDoc.data();
     if (match.playerA !== uid && match.playerB !== uid) {
       return res.status(403).json({ error: "You are not in this match" });
     }
 
-    const folder    = "duelix/dispute_evidence/" + matchId.trim() + "/" + uid;
-    const secureUrl = await uploadToCloudinary(imageBase64.trim(), safeMime, folder);
-
-    const isPlayerA = match.playerA === uid;
-    const urlField  = isPlayerA ? "playerAEvidenceUrl" : "playerBEvidenceUrl";
-
-    // Save URL to the existing dispute document for this match
+    // Step 2: Find the existing dispute document BEFORE uploading to Cloudinary.
+    // A dispute record MUST exist before any Cloudinary upload is attempted.
+    // This enforces the required order: create dispute first, then upload evidence.
     const disputeSnap = await db.collection("disputes")
-      .where("matchId", "==", matchId.trim())
+      .where("matchId", "==", safeMatchId)
       .orderBy("createdAt", "desc")
       .limit(1)
       .get();
 
-    if (!disputeSnap.empty) {
-      await disputeSnap.docs[0].reference.set(
-        { [urlField]: secureUrl, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
-        { merge: true }
-      );
+    // Guard: verify snapshot, docs array, and length before accessing index 0
+    if (
+      !disputeSnap ||
+      !disputeSnap.docs ||
+      disputeSnap.docs.length === 0 ||
+      disputeSnap.empty
+    ) {
+      console.error("[dispute/upload-evidence] No dispute record found for matchId=" + safeMatchId + " — upload blocked to prevent orphaned Cloudinary file.");
+      return res.status(400).json({
+        error: "No dispute record found for this match. Please file a dispute before uploading evidence.",
+      });
     }
 
-    console.log("[dispute/upload-evidence] uid=" + uid + " matchId=" + matchId + " field=" + urlField + " url=" + secureUrl);
-    return res.json({ message: "Evidence uploaded successfully", secureUrl, field: urlField });
+    const disputeDoc  = disputeSnap.docs[0];
+    const disputeData = disputeDoc.data();
+    const disputeId   = disputeData.id || disputeDoc.id;
+
+    if (!disputeId) {
+      console.error("[dispute/upload-evidence] Dispute document has no id — upload blocked. matchId=" + safeMatchId);
+      return res.status(500).json({ error: "Dispute record is invalid. Please contact support." });
+    }
+
+    // Step 3: Now that a valid dispute document exists, upload to Cloudinary.
+    // Folder path uses "disputes_evidence" as required and includes the disputeId.
+    const folder    = "duelix/disputes_evidence/" + disputeId + "/" + uid;
+    const secureUrl = await uploadToCloudinary(imageBase64.trim(), safeMime, folder);
+
+    // Step 4: Attach the uploaded evidence URL to the existing dispute document.
+    const isPlayerA = match.playerA === uid;
+    const urlField  = isPlayerA ? "playerAEvidenceUrl" : "playerBEvidenceUrl";
+
+    await disputeDoc.reference.set(
+      {
+        [urlField]:  secureUrl,
+        updatedAt:   admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+
+    console.log(
+      "[dispute/upload-evidence] uid=" + uid +
+      " matchId=" + safeMatchId +
+      " disputeId=" + disputeId +
+      " field=" + urlField +
+      " url=" + secureUrl
+    );
+
+    return res.json({
+      message:    "Evidence uploaded successfully",
+      secureUrl,
+      field:      urlField,
+      disputeId,
+    });
+
   } catch (err) {
     console.error("[dispute/upload-evidence]", err.message);
     return res.status(500).json({ error: err.message });
@@ -1496,7 +1617,11 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     const existingSnap = await db.collection("coin_purchases").where("reference", "==", safeRef).limit(1).get();
     if (!existingSnap.empty) {
       const userDoc = await db.collection("users").doc(uid).get();
-      return res.status(409).json({ error: "This payment has already been processed.", newCoinBalance: userDoc.exists ? (userDoc.data().coins || 0) : 0, newRcBalance: userDoc.exists ? (userDoc.data().rcBalance || 0) : 0, coinsAdded: existingSnap.docs[0].data().coinsAdded || 0 });
+      // Guard: verify docs array before accessing index 0
+      const coinsAdded = (existingSnap.docs && existingSnap.docs.length > 0)
+        ? (existingSnap.docs[0].data().coinsAdded || 0)
+        : 0;
+      return res.status(409).json({ error: "This payment has already been processed.", newCoinBalance: userDoc.exists ? (userDoc.data().coins || 0) : 0, newRcBalance: userDoc.exists ? (userDoc.data().rcBalance || 0) : 0, coinsAdded });
     }
     const pendingDocSnap = await db.collection("pending_purchases").doc(safeRef).get();
     if (!pendingDocSnap.exists) return res.status(400).json({ error: "No pending purchase found for this reference." });
@@ -2158,13 +2283,14 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // DISPUTE ENDPOINT
-// New simplified flow:
-//   1. Player calls this endpoint with reason + optional comment +
-//      optional evidenceUrl (already uploaded to Cloudinary via
-//      /dispute/upload-evidence before calling this).
-//   2. Dispute document is created immediately with all fields.
-//   3. Opponent is notified to submit their own evidence.
-//   4. 5-minute timer runs server-side.
+// Required flow (enforced here):
+//   1. Create dispute document first.
+//   2. Obtain disputeId.
+//   3. Verify dispute document exists.
+//   4. Notify players.
+//   5. Evidence upload via /dispute/upload-evidence uses the
+//      disputeId to attach URLs only AFTER the record exists.
+//   6. 5-minute timer runs server-side.
 // =============================================================
 app.post("/matches/dispute", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2195,15 +2321,13 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       if (match.status === "cancelled") throw new Error("ALREADY_CANCELLED");
       opponentUid = match.playerA === uid ? match.playerB : match.playerA;
       matchData   = match;
-      const disputeRef    = db.collection("disputes").doc();
-      disputeId           = disputeRef.id;
-      const now           = admin.firestore.FieldValue.serverTimestamp();
+      const disputeRef      = db.collection("disputes").doc();
+      disputeId             = disputeRef.id;
+      const now             = admin.firestore.FieldValue.serverTimestamp();
       const disputeDeadline = new Date(Date.now() + DISPUTE_EXPIRY_MS);
 
-      // Store all required dispute fields including evidence URLs per player.
-      // The player who CREATED the dispute (uid) has their evidence saved
-      // immediately here. The OTHER player's fields stay empty until they
-      // submit via /matches/dispute/submit-opponent-evidence.
+      // Step 1: Dispute document is created FIRST with all required fields.
+      // Only after this succeeds can evidence uploads reference the disputeId.
       t.set(disputeRef, {
         id:               disputeId,
         matchId,
@@ -2257,11 +2381,19 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       });
     });
 
-    // Notify the player who opened the dispute — their evidence is already
-    // saved at this point, so they do NOT need to upload again.
+    // Step 2: Verify the dispute document was successfully created before
+    // notifying players or triggering any Cloudinary upload paths.
+    const verifyDisputeDoc = await db.collection("disputes").doc(disputeId).get();
+    if (!verifyDisputeDoc.exists) {
+      console.error("[dispute] CRITICAL: dispute document not found after creation. disputeId=" + disputeId);
+      return res.status(500).json({ error: "Dispute creation failed. Please try again." });
+    }
+
+    // Notify the player who opened the dispute — their evidence (if any)
+    // was already saved at creation time via the evidenceImage field.
     notifyEvidenceSubmitted(uid, matchId).catch(() => {});
 
-    // Notify opponent — they need to submit evidence (the disputer does not)
+    // Notify opponent — they need to submit evidence separately.
     if (opponentUid) {
       notifyUser(opponentUid, "match_dispute_opened", "Dispute Filed",
         "Your opponent has disputed the match. Please submit your evidence within 5 minutes.",
@@ -2273,10 +2405,14 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
     // 5-minute auto-close timer
     setTimeout(async () => {
       try {
-        const disputeDoc = await db.collection("disputes").doc(disputeId).get();
-        if (!disputeDoc.exists) return;
-        const d = disputeDoc.data();
-        if (d.status !== "pending") return;
+        // Re-fetch dispute document; guard against missing doc and undefined docs array
+        const disputeDocSnap = await db.collection("disputes").doc(disputeId).get();
+        if (!disputeDocSnap || !disputeDocSnap.exists) {
+          console.warn("[dispute-timer] Dispute document not found at timer expiry. disputeId=" + disputeId);
+          return;
+        }
+        const d = disputeDocSnap.data();
+        if (!d || d.status !== "pending") return;
 
         const hasAEvidence = !!(d.playerAEvidenceUrl);
         const hasBEvidence = !!(d.playerBEvidenceUrl);
@@ -2284,7 +2420,7 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
         if (!hasAEvidence && !hasBEvidence) {
           // Neither submitted — refund both and apply trust penalties
           const mDoc = await db.collection("matches").doc(matchId).get();
-          if (mDoc.exists) {
+          if (mDoc && mDoc.exists) {
             const mData = mDoc.data();
             const wt    = validateWalletType(mData.walletType);
             const fee   = mData.entryFee || 0;
@@ -2324,7 +2460,7 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
           });
           // Notify both players
           const mDoc = await db.collection("matches").doc(matchId).get();
-          if (mDoc.exists) {
+          if (mDoc && mDoc.exists) {
             const mData = mDoc.data();
             notifyUser(mData.playerA, "dispute_evidence_submitted", "Under Admin Review",
               "All evidence collected. An admin will review and decide the outcome.", { matchId, disputeId }).catch(() => {});
@@ -2376,24 +2512,38 @@ app.post("/matches/dispute/submit-opponent-evidence", verifyToken, async (req, r
       return res.status(400).json({ error: "Match is not currently disputed" });
     }
 
+    // Fetch the dispute document and guard against missing/empty results
     const disputeSnap = await db.collection("disputes")
       .where("matchId", "==", matchId)
       .orderBy("createdAt", "desc")
       .limit(1)
       .get();
 
-    if (disputeSnap.empty) return res.status(404).json({ error: "Dispute not found" });
+    // Guard: validate snapshot, docs array, and length before accessing index 0
+    if (
+      !disputeSnap ||
+      !disputeSnap.docs ||
+      disputeSnap.docs.length === 0 ||
+      disputeSnap.empty
+    ) {
+      console.error("[dispute/submit-opponent-evidence] No dispute document found for matchId=" + matchId);
+      return res.status(404).json({ error: "Dispute not found for this match" });
+    }
 
     const disputeDoc  = disputeSnap.docs[0];
     const disputeData = disputeDoc.data();
+
+    if (!disputeData) {
+      console.error("[dispute/submit-opponent-evidence] Dispute document data is null for matchId=" + matchId);
+      return res.status(500).json({ error: "Dispute record is invalid. Please contact support." });
+    }
 
     if (disputeData.status !== "pending") {
       return res.status(400).json({ error: "Evidence window has closed" });
     }
 
     // Reject if the caller is the player who created the dispute — they
-    // already submitted evidence at creation time and must not be asked
-    // (or allowed) to submit a second time through this endpoint.
+    // already submitted evidence at creation time.
     if (disputeData.disputedBy === uid) {
       return res.status(400).json({ error: "You already submitted evidence when you filed this dispute" });
     }

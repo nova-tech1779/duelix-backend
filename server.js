@@ -1331,7 +1331,7 @@ app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
     const isPlayerA = match.playerA === uid;
     const submittedField = isPlayerA ? "playerAEvidenceSubmitted" : "playerBEvidenceSubmitted";
 
-    await disputeDoc.reference.set(
+    await disputeDoc.ref.set(
       {
         [submittedField]: true,
         updatedAt: admin.firestore.FieldValue.serverTimestamp(),

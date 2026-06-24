@@ -103,8 +103,6 @@ function detectCountryFromPhone(phone) {
 
 // =============================================================
 // CLOUDINARY UPLOAD HELPER
-// All uploads go through the server — CLOUDINARY_API_SECRET is
-// never exposed to the client.
 // =============================================================
 
 const crypto_node = require("crypto");
@@ -298,6 +296,18 @@ function computeFairPlayRating(data) {
   return Math.max(0, Math.min(100, Math.round(base)));
 }
 
+// =============================================================
+// TRUST LEVEL HELPERS
+// =============================================================
+
+function getTrustLevel(score) {
+  if (score >= 95) return { name: "Elite",     emoji: "🟣" };
+  if (score >= 85) return { name: "Excellent", emoji: "🔵" };
+  if (score >= 70) return { name: "Good",      emoji: "🟢" };
+  if (score >= 50) return { name: "Risky",     emoji: "🟡" };
+  return               { name: "Dangerous",    emoji: "🔴" };
+}
+
 const DEFAULT_TRUST_FIELDS = {
   trustScore:          80,
   completedMatches:    0,
@@ -376,23 +386,9 @@ async function applyStrike(uid, reason) {
     };
 
     if (newStrikes === 1) {
-      notifyUser(
-        uid,
-        "strike_warning",
-        "Strike Warning — 1 of 5",
-        "Warning 1 of 5: " + reason + ". Continued abuse may result in suspension.",
-        { strikeCount: newStrikes, reason }
-      ).catch(() => {});
-
+      notifyUser(uid, "strike_warning", "Strike Warning — 1 of 5", "Warning 1 of 5: " + reason + ". Continued abuse may result in suspension.", { strikeCount: newStrikes, reason }).catch(() => {});
     } else if (newStrikes === 2) {
-      notifyUser(
-        uid,
-        "strike_warning",
-        "Strike Warning — 2 of 5",
-        "Warning 2 of 5: " + reason + ". Further violations will result in account suspension.",
-        { strikeCount: newStrikes, reason }
-      ).catch(() => {});
-
+      notifyUser(uid, "strike_warning", "Strike Warning — 2 of 5", "Warning 2 of 5: " + reason + ". Further violations will result in account suspension.", { strikeCount: newStrikes, reason }).catch(() => {});
     } else if (newStrikes === 3) {
       const bannedAt     = admin.firestore.FieldValue.serverTimestamp();
       const banExpiresAt = new Date(Date.now() + 12 * 60 * 60 * 1000);
@@ -402,14 +398,7 @@ async function applyStrike(uid, reason) {
       updateFields.banTimestamp  = bannedAt;
       updateFields.banExpiresAt  = admin.firestore.Timestamp.fromDate(banExpiresAt);
       updateFields.bannedAt      = bannedAt;
-      notifyUser(
-        uid,
-        "account_suspended_24h",
-        "Account Suspended — 12 Hours",
-        "You have received Strike 3. Your account is suspended for 12 hours due to repeated violations.",
-        { strikeCount: newStrikes, banReason: "12 Hour Suspension" }
-      ).catch(() => {});
-
+      notifyUser(uid, "account_suspended_24h", "Account Suspended — 12 Hours", "You have received Strike 3. Your account is suspended for 12 hours due to repeated violations.", { strikeCount: newStrikes, banReason: "12 Hour Suspension" }).catch(() => {});
     } else if (newStrikes === 4) {
       const bannedAt     = admin.firestore.FieldValue.serverTimestamp();
       const banExpiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -419,14 +408,7 @@ async function applyStrike(uid, reason) {
       updateFields.banTimestamp  = bannedAt;
       updateFields.banExpiresAt  = admin.firestore.Timestamp.fromDate(banExpiresAt);
       updateFields.bannedAt      = bannedAt;
-      notifyUser(
-        uid,
-        "account_suspended_24h",
-        "Account Suspended — 24 Hours",
-        "You have received Strike 4. Your account is suspended for 24 hours. One more violation will result in a permanent ban.",
-        { strikeCount: newStrikes, banReason: "24 Hour Suspension" }
-      ).catch(() => {});
-
+      notifyUser(uid, "account_suspended_24h", "Account Suspended — 24 Hours", "You have received Strike 4. Your account is suspended for 24 hours. One more violation will result in a permanent ban.", { strikeCount: newStrikes, banReason: "24 Hour Suspension" }).catch(() => {});
     } else if (newStrikes >= 5) {
       const bannedAt = admin.firestore.FieldValue.serverTimestamp();
       updateFields.isBanned     = true;
@@ -434,13 +416,7 @@ async function applyStrike(uid, reason) {
       updateFields.banCreatedAt = bannedAt;
       updateFields.banTimestamp = bannedAt;
       updateFields.bannedAt     = bannedAt;
-      notifyUser(
-        uid,
-        "account_banned",
-        "Account Permanently Restricted",
-        "Strike 5 received. Your account has been permanently restricted. Please use the appeal form.",
-        { strikeCount: newStrikes, banReason: "Permanent Suspension" }
-      ).catch(() => {});
+      notifyUser(uid, "account_banned", "Account Permanently Restricted", "Strike 5 received. Your account has been permanently restricted. Please use the appeal form.", { strikeCount: newStrikes, banReason: "Permanent Suspension" }).catch(() => {});
     }
 
     await userRef.update(updateFields);
@@ -454,22 +430,14 @@ async function applyStrike(uid, reason) {
 // DISPUTE VALIDATORS
 // =============================================================
 const VALID_DISPUTE_REASONS = [
-  "Wrong Score Submitted",
-  "Opponent Left Match",
-  "Cheating Suspected",
-  "Fake Result",
-  "Other",
-  // Legacy reasons kept for backwards compatibility
-  "Wrong Score", "Opponent Quit", "Fake Submission",
-  "Time Wasting", "Abuse", "Other Issue",
+  "Wrong Score Submitted", "Opponent Left Match", "Cheating Suspected", "Fake Result", "Other",
+  "Wrong Score", "Opponent Quit", "Fake Submission", "Time Wasting", "Abuse", "Other Issue",
 ];
 
 function validateDisputeReason(reason) {
   if (!reason || typeof reason !== "string") throw new Error("reason is required");
   const trimmed = reason.trim();
-  if (!VALID_DISPUTE_REASONS.includes(trimmed)) {
-    console.warn("[dispute] Non-standard reason: \"" + trimmed + "\" -- accepted");
-  }
+  if (!VALID_DISPUTE_REASONS.includes(trimmed)) console.warn("[dispute] Non-standard reason: \"" + trimmed + "\" -- accepted");
   if (trimmed.length < 2 || trimmed.length > 200) throw new Error("reason must be between 2 and 200 characters");
   return trimmed;
 }
@@ -588,14 +556,14 @@ async function refreshOnlinePlayersCount() {
   } catch (err) { console.error("[refreshOnlinePlayersCount]", err.message); }
 }
 
-async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
+async function updateLiveActivity(winnerUsername, winnerAvatar, entryFee, isDraw) {
   try {
     const ref   = db.collection("platform").doc("live_activity");
     const today = todayUtc();
     const snap  = await ref.get();
     if (!snap.exists) {
       const winners = (!isDraw && winnerUsername)
-        ? [{ username: winnerUsername, entryFee: entryFee || 0, timestamp: new Date().toISOString() }] : [];
+        ? [{ username: winnerUsername, avatar: winnerAvatar || "assets/avatars/avatar1.png", entryFee: entryFee || 0, timestamp: new Date().toISOString() }] : [];
       await ref.set({ matchesPlayedToday: 1, onlinePlayers: 0, recentWinners: winners, lastResetDate: today, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
       return;
     }
@@ -605,7 +573,7 @@ async function updateLiveActivity(winnerUsername, entryFee, isDraw) {
     const currentWinners = needsReset ? [] : (Array.isArray(data.recentWinners) ? data.recentWinners : []);
     let updatedWinners   = currentWinners;
     if (!isDraw && winnerUsername) {
-      updatedWinners = [{ username: winnerUsername, entryFee: entryFee || 0, timestamp: new Date().toISOString() }, ...currentWinners].slice(0, 3);
+      updatedWinners = [{ username: winnerUsername, avatar: winnerAvatar || "assets/avatars/avatar1.png", entryFee: entryFee || 0, timestamp: new Date().toISOString() }, ...currentWinners].slice(0, 3);
     }
     await ref.set({ matchesPlayedToday: currentCount + 1, recentWinners: updatedWinners, lastResetDate: today, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
   } catch (err) { console.error("[updateLiveActivity]", err.message); }
@@ -810,7 +778,7 @@ async function sendPushNotification(userId, title, body, data) {
 // =============================================================
 
 function notificationFilterTag(type) {
-  const matchTypes  = ["match_found","match_joined","match_started","match_created","match_cancelled","match_refunded","match_result_submitted","match_result_confirmed","match_won","match_lost","match_draw","match_auto_resolved","match_auto_cancelled","match_dispute_opened","match_dispute_resolved","rematch_requested","rematch_accepted","rematch_declined","match_result","bonus_match_won","bonus_match_lost","bonus_match_draw","match_invite_joined"];
+  const matchTypes  = ["match_found","match_joined","match_started","match_created","match_cancelled","match_refunded","match_result_submitted","match_result_confirmed","match_won","match_lost","match_draw","match_auto_resolved","match_auto_cancelled","match_dispute_opened","match_dispute_resolved","rematch_requested","rematch_accepted","rematch_declined","match_result","bonus_match_won","bonus_match_lost","bonus_match_draw","match_invite_joined","quick_match_found","quick_match_expired","quick_match_cancelled"];
   const rewardTypes = ["coins_added","reward_payout","coin_purchase","purchase_successful","redeem_successful","rc_earned","redemption_requested","redemption_approved","redemption_rejected","reward","rc_converted"];
   const socialTypes = ["friend_request","friend_accepted","chat_message"];
   const referralTypes = ["referral","referral_reward"];
@@ -923,21 +891,12 @@ function notifyStrikeWarning(userId, strikeCount, reason) {
     5: "Strike 5: Your account has been permanently restricted. Please appeal via the app.",
   };
   const titles = {
-    1: "Strike Warning — 1 of 5",
-    2: "Strike Warning — 2 of 5",
-    3: "Account Suspended 12h — Strike 3",
-    4: "Account Suspended 24h — Strike 4",
-    5: "Account Permanently Restricted",
+    1: "Strike Warning — 1 of 5", 2: "Strike Warning — 2 of 5",
+    3: "Account Suspended 12h — Strike 3", 4: "Account Suspended 24h — Strike 4", 5: "Account Permanently Restricted",
   };
   const clampedCount = Math.min(strikeCount, 5);
   const notifType = clampedCount >= 5 ? "account_banned" : clampedCount >= 3 ? "account_suspended_24h" : "strike_warning";
-  return notifyUser(
-    userId,
-    notifType,
-    titles[clampedCount] || "Strike Warning",
-    msgs[clampedCount] || reason,
-    { strikeCount, reason }
-  );
+  return notifyUser(userId, notifType, titles[clampedCount] || "Strike Warning", msgs[clampedCount] || reason, { strikeCount, reason });
 }
 function notifyEvidenceRequired(userId, matchId, deadline) {
   return notifyUser(userId, "dispute_evidence_required", "Evidence Required", "A dispute has been opened for your match. Submit your evidence within 5 minutes.", { matchId, deadline });
@@ -986,6 +945,19 @@ function notifyRoomTimer(userId, matchId, alertType) {
 }
 
 // =============================================================
+// QUICK MATCH FOUND NOTIFICATIONS
+// =============================================================
+function notifyQuickMatchFound(userId, matchRequestId, opponentUsername, opponentTrustScore, opponentTrustLevel, opponentAvatar) {
+  return notifyUser(userId, "quick_match_found", "⚡ Opponent Found!", "You have 10 seconds to accept the match against " + opponentUsername + ".", { matchRequestId, opponentUsername, opponentTrustScore: String(opponentTrustScore), opponentTrustLevel, opponentAvatar: opponentAvatar || "assets/avatars/avatar1.png" });
+}
+function notifyQuickMatchExpired(userId, matchRequestId) {
+  return notifyUser(userId, "quick_match_expired", "Match Request Expired", "The match request expired before both players accepted.", { matchRequestId });
+}
+function notifyQuickMatchCancelled(userId, matchRequestId) {
+  return notifyUser(userId, "quick_match_cancelled", "Match Request Cancelled", "The match request was cancelled by the other player.", { matchRequestId });
+}
+
+// =============================================================
 // REWARD DISTRIBUTION -- GAMEPLAY CONFIRM-RESULT PATH
 // =============================================================
 async function distributeReward(t, match, matchRef, confirmedWinner) {
@@ -1015,7 +987,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
     const platformCoins = platformDoc.exists ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, { totalCoins: inc(platformCoins, dPlat), lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    updateLiveActivity(null, match.entryFee, true).catch(() => {});
+    updateLiveActivity(null, null, match.entryFee, true).catch(() => {});
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
     const winnerRef  = db.collection("users").doc(confirmedWinner);
@@ -1034,7 +1006,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     const platformCoins = platformDoc.exists ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, { totalCoins: inc(platformCoins, plat), lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     if (rc > 0) createTransactionRecord(confirmedWinner, "rc_earned", rc, "RC earned for winning match " + match.id, { matchId: match.id, entryFee: match.entryFee, coinsWon: winner, walletType: "gameplay" }).catch(() => {});
-    updateLiveActivity(winnerData.displayName || "Player", match.entryFee, false).catch(() => {});
+    updateLiveActivity(winnerData.displayName || "Player", winnerData.avatar || "assets/avatars/avatar1.png", match.entryFee, false).catch(() => {});
   }
 
   t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: confirmedWinner === "draw" ? 0 : winner, winnerRc: confirmedWinner === "draw" ? 0 : rc, loserReward: confirmedWinner === "draw" ? 0 : loser, walletType: "gameplay", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null });
@@ -1055,7 +1027,7 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
     const refund = bonusDrawRefund(match.entryFee);
     t.update(playerA_Ref, { bonusCoins: inc(Number(playerA_Data.bonusCoins) || 0, refund), draws: inc(playerA_Data.draws), totalMatches: inc(playerA_Data.totalMatches), completedMatches: inc(playerA_Data.completedMatches) });
     t.update(playerB_Ref, { bonusCoins: inc(Number(playerB_Data.bonusCoins) || 0, refund), draws: inc(playerB_Data.draws), totalMatches: inc(playerB_Data.totalMatches), completedMatches: inc(playerB_Data.completedMatches) });
-    updateLiveActivity(null, match.entryFee, true).catch(() => {});
+    updateLiveActivity(null, null, match.entryFee, true).catch(() => {});
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
     const winnerRef  = db.collection("users").doc(confirmedWinner);
@@ -1067,7 +1039,7 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
     const bonusWin   = bonusWinnerReward(match.entryFee);
     t.update(winnerRef, { coins: inc(winnerData.coins != null ? winnerData.coins : 0, bonusWin), wins: inc(winnerData.wins != null ? winnerData.wins : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0), completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0) });
     t.update(loserRef,  { losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
-    updateLiveActivity(winnerData.displayName || "Player", match.entryFee, false).catch(() => {});
+    updateLiveActivity(winnerData.displayName || "Player", winnerData.avatar || "assets/avatars/avatar1.png", match.entryFee, false).catch(() => {});
   }
   const bonusWin = confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee);
   const refund   = confirmedWinner === "draw" ? bonusDrawRefund(match.entryFee) : 0;
@@ -1101,7 +1073,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     applyCleanMatchReward(t, playerB_Ref, bUpdated);
     const platformCoins = platformDoc.exists ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, { totalCoins: inc(platformCoins, dPlat), lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
-    updateLiveActivity(null, match.entryFee, true).catch(() => {});
+    updateLiveActivity(null, null, match.entryFee, true).catch(() => {});
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
     const winnerRef  = db.collection("users").doc(confirmedWinner);
@@ -1120,7 +1092,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     const platformCoins = platformDoc.exists ? (platformDoc.data().totalCoins != null ? platformDoc.data().totalCoins : 0) : 0;
     t.set(platformRef, { totalCoins: inc(platformCoins, plat), lastUpdated: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
     if (rc > 0 && confirmedWinner !== nonSubmitterUid) createTransactionRecord(confirmedWinner, "rc_earned", rc, "RC earned for winning match (auto-resolved) " + match.id, { matchId: match.id, entryFee: match.entryFee, coinsWon: winner, walletType: "gameplay" }).catch(() => {});
-    updateLiveActivity(winnerData.displayName || "Player", match.entryFee, false).catch(() => {});
+    updateLiveActivity(winnerData.displayName || "Player", winnerData.avatar || "assets/avatars/avatar1.png", match.entryFee, false).catch(() => {});
   }
   t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: confirmedWinner === "draw" ? 0 : winner, winnerRc: confirmedWinner === "draw" ? 0 : rc, loserReward: confirmedWinner === "draw" ? 0 : loser, walletType: "gameplay", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null });
   return { winner, rc, loser, confirmedWinner };
@@ -1140,7 +1112,7 @@ async function distributeBonusRewardAutoResolve(t, match, matchRef, confirmedWin
     const refund = bonusDrawRefund(match.entryFee);
     t.update(playerA_Ref, { bonusCoins: inc(Number(playerA_Data.bonusCoins) || 0, refund), draws: inc(playerA_Data.draws), totalMatches: inc(playerA_Data.totalMatches), completedMatches: inc(playerA_Data.completedMatches) });
     t.update(playerB_Ref, { bonusCoins: inc(Number(playerB_Data.bonusCoins) || 0, refund), draws: inc(playerB_Data.draws), totalMatches: inc(playerB_Data.totalMatches), completedMatches: inc(playerB_Data.completedMatches) });
-    updateLiveActivity(null, match.entryFee, true).catch(() => {});
+    updateLiveActivity(null, null, match.entryFee, true).catch(() => {});
   } else {
     const loserUid   = confirmedWinner === match.playerA ? match.playerB : match.playerA;
     const winnerRef  = db.collection("users").doc(confirmedWinner);
@@ -1156,7 +1128,7 @@ async function distributeBonusRewardAutoResolve(t, match, matchRef, confirmedWin
       t.update(winnerRef, { wins: inc(winnerData.wins != null ? winnerData.wins : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0), completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0) });
     }
     t.update(loserRef, { losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
-    updateLiveActivity(winnerDoc.data().displayName || "Player", match.entryFee, false).catch(() => {});
+    updateLiveActivity(winnerDoc.data().displayName || "Player", winnerDoc.data().avatar || "assets/avatars/avatar1.png", match.entryFee, false).catch(() => {});
   }
   const bonusWin = confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee);
   const refund   = confirmedWinner === "draw" ? bonusDrawRefund(match.entryFee) : 0;
@@ -1180,7 +1152,6 @@ app.post("/user/check-ban", verifyToken, async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
     const data = userDoc.data();
     if (!data.isBanned) return res.json({ isBanned: false });
-
     if (data.banReason === "12 Hour Suspension" || data.banReason === "24 Hour Suspension") {
       let expired = false;
       if (data.banExpiresAt) {
@@ -1188,29 +1159,15 @@ app.post("/user/check-ban", verifyToken, async (req, res) => {
         expired = expiresMs > 0 && Date.now() >= expiresMs;
       } else if (data.bannedAt) {
         const bannedMs = data.bannedAt._seconds ? data.bannedAt._seconds * 1000 : data.bannedAt.toMillis ? data.bannedAt.toMillis() : 0;
-        const durationMs = data.banReason === "12 Hour Suspension"
-          ? 12 * 60 * 60 * 1000
-          : 24 * 60 * 60 * 1000;
+        const durationMs = data.banReason === "12 Hour Suspension" ? 12 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
         expired = bannedMs > 0 && (Date.now() - bannedMs) > durationMs;
       }
       if (expired) {
-        await db.collection("users").doc(uid).update({
-          isBanned: false, banReason: "", bannedAt: null,
-          banCreatedAt: null, banExpiresAt: null, banTimestamp: null,
-        });
+        await db.collection("users").doc(uid).update({ isBanned: false, banReason: "", bannedAt: null, banCreatedAt: null, banExpiresAt: null, banTimestamp: null });
         return res.json({ isBanned: false });
       }
     }
-
-    return res.json({
-      isBanned:      true,
-      banReason:     data.banReason     || "",
-      strikeCount:   data.strikeCount   || 0,
-      bannedAt:      data.bannedAt      || null,
-      banCreatedAt:  data.banCreatedAt  || null,
-      banExpiresAt:  data.banExpiresAt  || null,
-      banTimestamp:  data.banTimestamp  || null,
-    });
+    return res.json({ isBanned: true, banReason: data.banReason || "", strikeCount: data.strikeCount || 0, bannedAt: data.bannedAt || null, banCreatedAt: data.banCreatedAt || null, banExpiresAt: data.banExpiresAt || null, banTimestamp: data.banTimestamp || null });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
@@ -1220,25 +1177,14 @@ app.post("/user/check-ban", verifyToken, async (req, res) => {
 app.post("/user/submit-appeal", verifyToken, async (req, res) => {
   const uid = req.user.uid;
   const { appealText } = req.body;
-  if (!appealText || typeof appealText !== "string" || !appealText.trim()) {
-    return res.status(400).json({ error: "appealText is required" });
-  }
+  if (!appealText || typeof appealText !== "string" || !appealText.trim()) return res.status(400).json({ error: "appealText is required" });
   const safeText = appealText.trim().substring(0, 1000);
   try {
     const userDoc = await db.collection("users").doc(uid).get();
     if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
     const data = userDoc.data();
     const appealRef = db.collection("appeals").doc();
-    await appealRef.set({
-      id:          appealRef.id,
-      userId:      uid,
-      displayName: data.displayName || "",
-      strikeCount: data.strikeCount || 0,
-      banReason:   data.banReason   || "",
-      appealText:  safeText,
-      status:      "pending",
-      createdAt:   admin.firestore.FieldValue.serverTimestamp(),
-    });
+    await appealRef.set({ id: appealRef.id, userId: uid, displayName: data.displayName || "", strikeCount: data.strikeCount || 0, banReason: data.banReason || "", appealText: safeText, status: "pending", createdAt: admin.firestore.FieldValue.serverTimestamp() });
     return res.status(201).json({ message: "Appeal submitted successfully", appealId: appealRef.id });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
@@ -1267,102 +1213,41 @@ app.get("/platform/live-activity", verifyToken, async (req, res) => {
 
 // =============================================================
 // CLOUDINARY -- SECURE EVIDENCE UPLOAD ENDPOINT
-//
-// SIMPLIFIED FLOW:
-//   1. Validate request (matchId, imageBase64).
-//   2. Verify the caller is in the match.
-//   3. Verify a dispute document exists for this match.
-//   4. Upload to Cloudinary (admin reviews screenshots there directly).
-//   5. Mark playerAEvidenceSubmitted or playerBEvidenceSubmitted = true
-//      in the dispute document. No URL is stored in Firestore.
 // =============================================================
 app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
   const uid = req.user.uid;
   const { matchId, imageBase64, mimeType } = req.body;
-
-  if (!matchId || typeof matchId !== "string" || !matchId.trim())
-    return res.status(400).json({ error: "matchId is required" });
-  if (!imageBase64 || typeof imageBase64 !== "string" || !imageBase64.trim())
-    return res.status(400).json({ error: "imageBase64 is required" });
-
-  const safeMime = (mimeType && typeof mimeType === "string" && mimeType.startsWith("image/"))
-    ? mimeType
-    : "image/jpeg";
-
+  if (!matchId || typeof matchId !== "string" || !matchId.trim()) return res.status(400).json({ error: "matchId is required" });
+  if (!imageBase64 || typeof imageBase64 !== "string" || !imageBase64.trim()) return res.status(400).json({ error: "imageBase64 is required" });
+  const safeMime = (mimeType && typeof mimeType === "string" && mimeType.startsWith("image/")) ? mimeType : "image/jpeg";
   const safeMatchId = matchId.trim();
-
   try {
-    // Step 1: Verify match exists and caller is a participant
     const matchDoc = await db.collection("matches").doc(safeMatchId).get();
     if (!matchDoc.exists) return res.status(404).json({ error: "Match not found" });
     const match = matchDoc.data();
-    if (match.playerA !== uid && match.playerB !== uid) {
-      return res.status(403).json({ error: "You are not in this match" });
-    }
-
-    // Step 2: Find the existing dispute document — must exist before upload
-    const disputeSnap = await db.collection("disputes")
-      .where("matchId", "==", safeMatchId)
-      .orderBy("createdAt", "desc")
-      .limit(1)
-      .get();
-
+    if (match.playerA !== uid && match.playerB !== uid) return res.status(403).json({ error: "You are not in this match" });
+    const disputeSnap = await db.collection("disputes").where("matchId", "==", safeMatchId).orderBy("createdAt", "desc").limit(1).get();
     if (!disputeSnap || !disputeSnap.docs || disputeSnap.docs.length === 0 || disputeSnap.empty) {
       console.error("[dispute/upload-evidence] No dispute record found for matchId=" + safeMatchId);
-      return res.status(400).json({
-        error: "No dispute record found for this match. Please file a dispute before uploading evidence.",
-      });
+      return res.status(400).json({ error: "No dispute record found for this match. Please file a dispute before uploading evidence." });
     }
-
     const disputeDoc  = disputeSnap.docs[0];
     const disputeData = disputeDoc.data();
     const disputeId   = disputeData.id || disputeDoc.id;
-
-    if (!disputeId) {
-      console.error("[dispute/upload-evidence] Dispute document has no id for matchId=" + safeMatchId);
-      return res.status(500).json({ error: "Dispute record is invalid. Please contact support." });
-    }
-
-    // Step 3: Upload to Cloudinary — admin reviews screenshots directly there
+    if (!disputeId) { console.error("[dispute/upload-evidence] Dispute document has no id for matchId=" + safeMatchId); return res.status(500).json({ error: "Dispute record is invalid. Please contact support." }); }
     const folder    = "duelix/disputes_evidence/" + disputeId + "/" + uid;
     const secureUrl = await uploadToCloudinary(imageBase64.trim(), safeMime, folder);
-
-    // Step 4: Mark evidence as submitted (boolean only — no URL stored in Firestore)
     const isPlayerA = match.playerA === uid;
     const submittedField = isPlayerA ? "playerAEvidenceSubmitted" : "playerBEvidenceSubmitted";
-
-    await disputeDoc.ref.set(
-      {
-        [submittedField]: true,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      },
-      { merge: true }
-    );
-
-    console.log(
-      "[dispute/upload-evidence] uid=" + uid +
-      " matchId=" + safeMatchId +
-      " disputeId=" + disputeId +
-      " field=" + submittedField +
-      " cloudinaryUrl=" + secureUrl
-    );
-
-    return res.json({
-      message:   "Evidence uploaded successfully",
-      submitted: true,
-      disputeId,
-    });
-
-  } catch (err) {
-    console.error("[dispute/upload-evidence]", err.message);
-    return res.status(500).json({ error: err.message });
-  }
+    await disputeDoc.ref.set({ [submittedField]: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+    console.log("[dispute/upload-evidence] uid=" + uid + " matchId=" + safeMatchId + " disputeId=" + disputeId + " field=" + submittedField + " cloudinaryUrl=" + secureUrl);
+    return res.json({ message: "Evidence uploaded successfully", submitted: true, disputeId });
+  } catch (err) { console.error("[dispute/upload-evidence]", err.message); return res.status(500).json({ error: err.message }); }
 });
 
 // =============================================================
 // MATCH ROOM PRESENCE ENDPOINTS
 // =============================================================
-
 app.post("/matches/presence/enter", verifyToken, async (req, res) => {
   const uid = req.user.uid;
   const { matchId } = req.body;
@@ -1424,7 +1309,6 @@ app.get("/matches/:matchId/presence", verifyToken, async (req, res) => {
 // =============================================================
 // INVITE SYSTEM
 // =============================================================
-
 app.get("/api/matches/:matchId/invite", async (req, res) => {
   const { matchId } = req.params;
   if (!matchId || typeof matchId !== "string" || !matchId.trim()) return res.status(400).json({ error: "matchId is required" });
@@ -1587,9 +1471,7 @@ app.post("/store/verify-purchase", verifyToken, async (req, res) => {
     const existingSnap = await db.collection("coin_purchases").where("reference", "==", safeRef).limit(1).get();
     if (!existingSnap.empty) {
       const userDoc = await db.collection("users").doc(uid).get();
-      const coinsAdded = (existingSnap.docs && existingSnap.docs.length > 0)
-        ? (existingSnap.docs[0].data().coinsAdded || 0)
-        : 0;
+      const coinsAdded = (existingSnap.docs && existingSnap.docs.length > 0) ? (existingSnap.docs[0].data().coinsAdded || 0) : 0;
       return res.status(409).json({ error: "This payment has already been processed.", newCoinBalance: userDoc.exists ? (userDoc.data().coins || 0) : 0, newRcBalance: userDoc.exists ? (userDoc.data().rcBalance || 0) : 0, coinsAdded });
     }
     const pendingDocSnap = await db.collection("pending_purchases").doc(safeRef).get();
@@ -1947,7 +1829,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     if (data.strikeCount === undefined) patch.strikeCount = 0;
     if (data.isBanned    === undefined) patch.isBanned    = false;
     if (data.banReason   === undefined) patch.banReason   = "";
-
     if (data.trustScore === undefined) {
       const trustFields = { trustScore: 80, completedMatches: data.completedMatches || 0, cancelledMatches: data.cancelledMatches || 0, disputesLost: data.disputesLost || 0, reportsReceived: data.reportsReceived || 0, fakeResults: data.fakeResults || 0, rageQuits: data.rageQuits || 0, fairPlayRating: 100, matchCompletionRate: 0, cleanMatchBonus: 0, fairPlayBonus: 0, rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, onlineStatus: data.onlineStatus !== undefined ? data.onlineStatus : true, friendRequests: data.friendRequests !== undefined ? data.friendRequests : true, country: patch.country || data.country || "Unknown", currency: patch.currency || data.currency || "Unknown", strikeCount: data.strikeCount || 0, isBanned: data.isBanned || false, banReason: data.banReason || "" };
       Object.assign(trustFields, patch);
@@ -2134,53 +2015,441 @@ app.post("/matches/cancel", verifyToken, async (req, res) => {
   } catch (err) { return res.status(400).json({ error: err.message }); }
 });
 
+// =============================================================
+// QUICK MATCH -- NEW ACCEPTANCE FLOW
+//
+// Statuses: searching | match_found | accepted | cancelled | expired | confirmed
+//
+// Flow:
+//   POST /matches/quick-match  → creates/joins a match_request document
+//   POST /matches/quick-match/accept  → player accepts
+//   POST /matches/quick-match/cancel  → player cancels
+//
+// When a second player calls /matches/quick-match and finds a waiting request:
+//   - Both players' entries are linked
+//   - matchFoundAt + acceptDeadline (10s) are set
+//   - status → match_found
+//   - Both players are notified
+//
+// Server-side expiry timer checks after 10 seconds:
+//   - Both accepted → create match → status confirmed
+//   - Otherwise → expire → refund both → status expired
+// =============================================================
+
+const QUICK_MATCH_ACCEPT_TIMEOUT_MS = 10 * 1000;
+
+// Helper: refund a quick match request for both players
+async function refundQuickMatchRequest(requestDoc) {
+  const data = requestDoc.data();
+  const wt   = validateWalletType(data.walletType);
+  const fee  = data.entryFee || 0;
+  const uids = [data.playerA, data.playerB].filter(Boolean);
+  if (uids.length === 0 || fee === 0) return;
+  const batch = db.batch();
+  for (const uid of uids) {
+    const userRef = db.collection("users").doc(uid);
+    if (wt === "bonus") {
+      const userDoc = await userRef.get();
+      if (userDoc.exists) batch.update(userRef, { bonusCoins: inc(Number(userDoc.data().bonusCoins) || 0, fee) });
+    } else {
+      const userDoc = await userRef.get();
+      if (userDoc.exists) batch.update(userRef, { coins: inc(userDoc.data().coins, fee) });
+    }
+  }
+  batch.update(requestDoc.ref, { status: "expired", expiredAt: admin.firestore.FieldValue.serverTimestamp() });
+  await batch.commit();
+}
+
 app.post("/matches/quick-match", verifyToken, async (req, res) => {
   const { game, entryFee, walletType: rawWalletType } = req.body;
   const uid = req.user.uid, walletType = validateWalletType(rawWalletType);
   if (!game || typeof game !== "string" || !game.trim()) return res.status(400).json({ error: "game is required" });
   try { validateEntryFee(entryFee); } catch (err) { return res.status(400).json({ error: err.message }); }
   const gameUpper = game.trim().toUpperCase();
+
   try {
-    let matchId = null, didCreate = false, playerAUid = null;
-    const candidateSnap = await db.collection("matches").where("status", "==", "waiting").where("game", "==", gameUpper).where("entryFee", "==", entryFee).where("walletType", "==", walletType).where("isPrivate", "==", false).orderBy("createdAt", "asc").limit(10).get();
-    const candidates = candidateSnap.docs.filter((doc) => { const d = doc.data(); return d.playerA !== uid && d.playerB === null; });
-    if (candidates.length > 0) {
-      matchId = candidates[0].id;
-      await db.runTransaction(async (t) => {
-        const matchRef = db.collection("matches").doc(matchId);
-        const userRef  = db.collection("users").doc(uid);
-        const [matchDoc, userDoc] = await Promise.all([t.get(matchRef), t.get(userRef)]);
-        if (!matchDoc.exists) throw new Error("Match no longer exists");
-        if (!userDoc.exists)  throw new Error("User not found");
-        const match = matchDoc.data(), userData = userDoc.data();
-        if (match.status !== "waiting") throw new Error("Match no longer available");
-        if (match.playerA === uid)      throw new Error("Cannot join your own match");
-        if (match.playerB != null)      throw new Error("Match already taken");
-        if (match.isPrivate === true)   throw new Error("Cannot join a private match");
-        if (walletType === "bonus") { const bc = userData.bonusCoins != null ? Number(userData.bonusCoins) : 0; if (bc < match.entryFee) throw new Error("Insufficient Bonus Coins"); t.update(userRef, { bonusCoins: bc - match.entryFee }); }
-        else { const coins = userData.coins != null ? userData.coins : 0; if (coins < match.entryFee) throw new Error("Insufficient Gameplay Coins"); t.update(userRef, { coins: coins - match.entryFee }); }
-        playerAUid = match.playerA;
-        const now = admin.firestore.FieldValue.serverTimestamp();
-        t.update(matchRef, { playerB: uid, opponentUid: uid, opponentUsername: userData.displayName || "", players: admin.firestore.FieldValue.arrayUnion(uid), status: "active", startedAt: now, matchStartedAt: now, joinedAt: now, inviteEnabled: false });
-      });
-      if (playerAUid) { notifyMatchJoined(playerAUid, uid, matchId, gameUpper).catch(() => {}); notifyMatchStarted(playerAUid, uid, matchId, gameUpper).catch(() => {}); }
+    // Fetch caller's user data + opponent info upfront
+    const userDoc = await db.collection("users").doc(uid).get();
+    if (!userDoc.exists) return res.status(400).json({ error: "User not found" });
+    const userData = userDoc.data();
+    const wt       = walletType;
+
+    // Wallet check
+    if (wt === "bonus") {
+      const bc = Number(userData.bonusCoins) || 0;
+      if (bc < entryFee) return res.status(400).json({ error: "Insufficient Bonus Coins" });
     } else {
-      didCreate = true;
-      await db.runTransaction(async (t) => {
-        const userRef  = db.collection("users").doc(uid);
-        const matchRef = db.collection("matches").doc();
-        matchId = matchRef.id;
-        const userDoc = await t.get(userRef);
-        if (!userDoc.exists) throw new Error("User not found");
-        const userData = userDoc.data();
-        if (walletType === "bonus") { const bc = userData.bonusCoins != null ? Number(userData.bonusCoins) : 0; if (bc < entryFee) throw new Error("Insufficient Bonus Coins"); t.update(userRef, { bonusCoins: bc - entryFee }); }
-        else { const coins = userData.coins != null ? userData.coins : 0; if (coins < entryFee) throw new Error("Insufficient Gameplay Coins"); t.update(userRef, { coins: coins - entryFee }); }
-        t.set(matchRef, { id: matchId, playerA: uid, playerB: null, hostUid: uid, hostUsername: userData.displayName || "", opponentUid: null, opponentUsername: null, players: [uid], game: gameUpper, entryFee, walletType, status: "waiting", matchType: "quick", isPrivate: false, result: null, submittedBy: null, submittedAt: null, confirmedWinner: null, rewarded: false, inviteEnabled: false, joinedViaInvite: false, createdAt: admin.firestore.FieldValue.serverTimestamp(), startedAt: null, matchStartedAt: null, joinedAt: null, rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null, autoResolved: false, autoCancelled: false, cancelReason: null, playerAInMatchRoom: false, playerBInMatchRoom: false, playerAHeartbeat: null, playerBHeartbeat: null });
-      });
-      notifyMatchCreated(uid, matchId, gameUpper, entryFee, walletType).catch(() => {});
+      const coins = userData.coins != null ? userData.coins : 0;
+      if (coins < entryFee) return res.status(400).json({ error: "Insufficient Gameplay Coins" });
     }
-    return res.status(didCreate ? 201 : 200).json({ matchId, action: didCreate ? "created" : "joined", status: didCreate ? "waiting" : "active", walletType, winnerReward: walletType === "bonus" ? bonusWinnerReward(entryFee) : winnerReward(entryFee), winnerRc: walletType === "bonus" ? 0 : winnerRc(entryFee), loserReward: walletType === "bonus" ? 0 : loserReward(entryFee) });
+
+    // Look for a waiting match request from another player
+    const candidateSnap = await db.collection("match_requests")
+      .where("status", "==", "searching")
+      .where("game", "==", gameUpper)
+      .where("entryFee", "==", entryFee)
+      .where("walletType", "==", wt)
+      .orderBy("createdAt", "asc")
+      .limit(10)
+      .get();
+
+    const candidates = candidateSnap.docs.filter((doc) => doc.data().playerA !== uid);
+
+    if (candidates.length > 0) {
+      // Found a waiting player — link both and move to match_found
+      const requestRef  = candidates[0].ref;
+      const requestData = candidates[0].data();
+      const playerAUid  = requestData.playerA;
+
+      // Fetch player A data for trust info to show player B
+      const playerADoc = await db.collection("users").doc(playerAUid).get();
+      const playerAData = playerADoc.exists ? playerADoc.data() : {};
+      const playerATrust = computeTrustScore(playerAData);
+      const playerATrustLevel = getTrustLevel(playerATrust);
+      const playerAAvatar = playerAData.avatar || "assets/avatars/avatar1.png";
+      const playerAUsername = playerAData.displayName || "Player";
+
+      // Caller is player B
+      const playerBTrust = computeTrustScore(userData);
+      const playerBTrustLevel = getTrustLevel(playerBTrust);
+      const playerBAvatar = userData.avatar || "assets/avatars/avatar1.png";
+      const playerBUsername = userData.displayName || "Player";
+
+      const now         = admin.firestore.FieldValue.serverTimestamp();
+      const deadline    = new Date(Date.now() + QUICK_MATCH_ACCEPT_TIMEOUT_MS);
+
+      // Deduct entry fee from player B
+      await db.runTransaction(async (t) => {
+        const userRef = db.collection("users").doc(uid);
+        const freshUser = await t.get(userRef);
+        if (!freshUser.exists) throw new Error("User not found");
+        const fresh = freshUser.data();
+        if (wt === "bonus") {
+          const bc = Number(fresh.bonusCoins) || 0;
+          if (bc < entryFee) throw new Error("Insufficient Bonus Coins");
+          t.update(userRef, { bonusCoins: bc - entryFee });
+        } else {
+          const coins = fresh.coins != null ? fresh.coins : 0;
+          if (coins < entryFee) throw new Error("Insufficient Gameplay Coins");
+          t.update(userRef, { coins: coins - entryFee });
+        }
+        t.update(requestRef, {
+          playerB:             uid,
+          playerBUsername,
+          playerBTrustScore:   playerBTrust,
+          playerBTrustLevel:   playerBTrustLevel.name,
+          playerBAvatar,
+          status:              "match_found",
+          matchFoundAt:        now,
+          acceptDeadline:      admin.firestore.Timestamp.fromDate(deadline),
+          playerAAccepted:     false,
+          playerBAccepted:     false,
+          updatedAt:           now,
+        });
+      });
+
+      const matchRequestId = requestRef.id;
+
+      // Notify player A (the one who was waiting)
+      notifyQuickMatchFound(
+        playerAUid, matchRequestId,
+        playerBUsername, playerBTrust, playerBTrustLevel.name, playerBAvatar
+      ).catch(() => {});
+
+      // Notify player B (the one who just matched)
+      notifyQuickMatchFound(
+        uid, matchRequestId,
+        playerAUsername, playerATrust, playerATrustLevel.name, playerAAvatar
+      ).catch(() => {});
+
+      // 10-second expiry timer
+      setTimeout(async () => {
+        try {
+          const reqSnap = await requestRef.get();
+          if (!reqSnap.exists) return;
+          const reqData = reqSnap.data();
+          if (reqData.status === "confirmed" || reqData.status === "expired" || reqData.status === "cancelled") return;
+
+          const aAccepted = reqData.playerAAccepted === true;
+          const bAccepted = reqData.playerBAccepted === true;
+
+          if (aAccepted && bAccepted) {
+            // Both accepted — create the match
+            await _createConfirmedMatch(requestRef, reqData);
+          } else {
+            // Expired — refund both
+            await refundQuickMatchRequest(reqSnap);
+            notifyQuickMatchExpired(reqData.playerA, matchRequestId).catch(() => {});
+            if (reqData.playerB) notifyQuickMatchExpired(reqData.playerB, matchRequestId).catch(() => {});
+            console.log("[quick-match] expired requestId=" + matchRequestId);
+          }
+        } catch (e) { console.error("[quick-match-timer]", e.message); }
+      }, QUICK_MATCH_ACCEPT_TIMEOUT_MS);
+
+      return res.json({
+        action:          "match_found",
+        matchRequestId,
+        status:          "match_found",
+        opponentUsername: playerAUsername,
+        opponentTrustScore: playerATrust,
+        opponentTrustLevel: playerATrustLevel.name,
+        opponentAvatar:  playerAAvatar,
+        acceptDeadline:  deadline.toISOString(),
+        walletType:      wt,
+        entryFee,
+        winnerReward:    wt === "bonus" ? bonusWinnerReward(entryFee) : winnerReward(entryFee),
+        winnerRc:        wt === "bonus" ? 0 : winnerRc(entryFee),
+        loserReward:     wt === "bonus" ? 0 : loserReward(entryFee),
+      });
+
+    } else {
+      // No waiting player — create a searching request (deduct fee now)
+      let matchRequestId;
+      await db.runTransaction(async (t) => {
+        const userRef    = db.collection("users").doc(uid);
+        const requestRef = db.collection("match_requests").doc();
+        matchRequestId   = requestRef.id;
+        const freshUser  = await t.get(userRef);
+        if (!freshUser.exists) throw new Error("User not found");
+        const fresh = freshUser.data();
+        if (wt === "bonus") {
+          const bc = Number(fresh.bonusCoins) || 0;
+          if (bc < entryFee) throw new Error("Insufficient Bonus Coins");
+          t.update(userRef, { bonusCoins: bc - entryFee });
+        } else {
+          const coins = fresh.coins != null ? fresh.coins : 0;
+          if (coins < entryFee) throw new Error("Insufficient Gameplay Coins");
+          t.update(userRef, { coins: coins - entryFee });
+        }
+        const playerTrust = computeTrustScore(fresh);
+        const playerTrustLevel = getTrustLevel(playerTrust);
+        t.set(requestRef, {
+          id:                 matchRequestId,
+          playerA:            uid,
+          playerAUsername:    fresh.displayName || "Player",
+          playerATrustScore:  playerTrust,
+          playerATrustLevel:  playerTrustLevel.name,
+          playerAAvatar:      fresh.avatar || "assets/avatars/avatar1.png",
+          playerAAccepted:    false,
+          playerB:            null,
+          playerBUsername:    null,
+          playerBTrustScore:  null,
+          playerBTrustLevel:  null,
+          playerBAvatar:      null,
+          playerBAccepted:    false,
+          game:               gameUpper,
+          entryFee,
+          walletType:         wt,
+          status:             "searching",
+          matchFoundAt:       null,
+          acceptDeadline:     null,
+          confirmedMatchId:   null,
+          createdAt:          admin.firestore.FieldValue.serverTimestamp(),
+          updatedAt:          admin.firestore.FieldValue.serverTimestamp(),
+        });
+      });
+
+      return res.status(201).json({
+        action:        "searching",
+        matchRequestId,
+        status:        "searching",
+        walletType:    wt,
+        entryFee,
+        winnerReward:  wt === "bonus" ? bonusWinnerReward(entryFee) : winnerReward(entryFee),
+        winnerRc:      wt === "bonus" ? 0 : winnerRc(entryFee),
+        loserReward:   wt === "bonus" ? 0 : loserReward(entryFee),
+      });
+    }
   } catch (err) { return res.status(400).json({ error: err.message }); }
+});
+
+// Helper: create confirmed match from a match_request
+async function _createConfirmedMatch(requestRef, reqData) {
+  const matchRef = db.collection("matches").doc();
+  const matchId  = matchRef.id;
+  const wt       = validateWalletType(reqData.walletType);
+  const now      = admin.firestore.FieldValue.serverTimestamp();
+
+  await db.runTransaction(async (t) => {
+    t.set(matchRef, {
+      id:              matchId,
+      playerA:         reqData.playerA,
+      playerB:         reqData.playerB,
+      hostUid:         reqData.playerA,
+      hostUsername:    reqData.playerAUsername || "",
+      opponentUid:     reqData.playerB,
+      opponentUsername: reqData.playerBUsername || "",
+      players:         [reqData.playerA, reqData.playerB],
+      game:            reqData.game,
+      entryFee:        reqData.entryFee,
+      walletType:      wt,
+      status:          "active",
+      matchType:       "quick",
+      isPrivate:       false,
+      result:          null,
+      submittedBy:     null,
+      submittedAt:     null,
+      confirmedWinner: null,
+      rewarded:        false,
+      inviteEnabled:   false,
+      joinedViaInvite: false,
+      createdAt:       now,
+      startedAt:       now,
+      matchStartedAt:  now,
+      joinedAt:        now,
+      rematchRequestedBy: null,
+      rematchStatus:   null,
+      rematchRequestedAt: null,
+      autoResolved:    false,
+      autoCancelled:   false,
+      cancelReason:    null,
+      playerAInMatchRoom: false,
+      playerBInMatchRoom: false,
+      playerAHeartbeat:   null,
+      playerBHeartbeat:   null,
+    });
+    t.update(requestRef, {
+      status:           "confirmed",
+      confirmedMatchId: matchId,
+      confirmedAt:      now,
+    });
+  });
+
+  notifyMatchStarted(reqData.playerA, reqData.playerB, matchId, reqData.game).catch(() => {});
+  console.log("[quick-match] confirmed matchId=" + matchId + " playerA=" + reqData.playerA + " playerB=" + reqData.playerB);
+  return matchId;
+}
+
+// Accept quick match
+app.post("/matches/quick-match/accept", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { matchRequestId } = req.body;
+  if (!matchRequestId || typeof matchRequestId !== "string" || !matchRequestId.trim()) {
+    return res.status(400).json({ error: "matchRequestId is required" });
+  }
+  const safeId = matchRequestId.trim();
+  try {
+    const requestRef = db.collection("match_requests").doc(safeId);
+    const requestDoc = await requestRef.get();
+    if (!requestDoc.exists) return res.status(404).json({ error: "Match request not found" });
+    const data = requestDoc.data();
+
+    if (data.status === "confirmed") {
+      return res.json({ status: "confirmed", matchId: data.confirmedMatchId, message: "Match already confirmed" });
+    }
+    if (data.status === "expired") return res.status(410).json({ error: "Match request has expired" });
+    if (data.status === "cancelled") return res.status(410).json({ error: "Match request was cancelled" });
+    if (data.status !== "match_found") return res.status(400).json({ error: "Match request is not in match_found state" });
+
+    // Check deadline
+    const deadline = data.acceptDeadline;
+    if (deadline) {
+      const deadlineMs = deadline._seconds ? deadline._seconds * 1000 : deadline.toMillis ? deadline.toMillis() : 0;
+      if (deadlineMs > 0 && Date.now() > deadlineMs) {
+        await refundQuickMatchRequest(requestDoc);
+        return res.status(410).json({ error: "Match request expired" });
+      }
+    }
+
+    const isPlayerA = data.playerA === uid;
+    const isPlayerB = data.playerB === uid;
+    if (!isPlayerA && !isPlayerB) return res.status(403).json({ error: "You are not in this match request" });
+
+    const acceptField = isPlayerA ? "playerAAccepted" : "playerBAccepted";
+    const now         = admin.firestore.FieldValue.serverTimestamp();
+    await requestRef.update({ [acceptField]: true, updatedAt: now });
+
+    // Re-read to check if both accepted
+    const updated = (await requestRef.get()).data();
+    if (updated.playerAAccepted === true && updated.playerBAccepted === true) {
+      // Both accepted — create match immediately
+      const matchId = await _createConfirmedMatch(requestRef, updated);
+      return res.json({ status: "confirmed", matchId, message: "Match confirmed — entering match room" });
+    }
+
+    return res.json({ status: "accepted", message: "Waiting for opponent to accept" });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// Cancel quick match request
+app.post("/matches/quick-match/cancel", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { matchRequestId } = req.body;
+  if (!matchRequestId || typeof matchRequestId !== "string" || !matchRequestId.trim()) {
+    return res.status(400).json({ error: "matchRequestId is required" });
+  }
+  const safeId = matchRequestId.trim();
+  try {
+    const requestRef = db.collection("match_requests").doc(safeId);
+    const requestDoc = await requestRef.get();
+    if (!requestDoc.exists) return res.status(404).json({ error: "Match request not found" });
+    const data = requestDoc.data();
+
+    if (data.status === "confirmed") return res.status(400).json({ error: "Match already confirmed — cannot cancel" });
+    if (data.status === "expired" || data.status === "cancelled") return res.json({ message: "Already cancelled or expired" });
+    if (data.playerA !== uid && data.playerB !== uid) return res.status(403).json({ error: "You are not in this match request" });
+
+    const wt   = validateWalletType(data.walletType);
+    const fee  = data.entryFee || 0;
+    const uids = [data.playerA, data.playerB].filter(Boolean);
+
+    // Refund both players
+    const batch = db.batch();
+    for (const playerId of uids) {
+      const userRef = db.collection("users").doc(playerId);
+      const userDoc = await userRef.get();
+      if (userDoc.exists) {
+        if (wt === "bonus") {
+          batch.update(userRef, { bonusCoins: inc(Number(userDoc.data().bonusCoins) || 0, fee) });
+        } else {
+          batch.update(userRef, { coins: inc(userDoc.data().coins, fee) });
+        }
+      }
+    }
+    batch.update(requestRef, { status: "cancelled", cancelledBy: uid, cancelledAt: admin.firestore.FieldValue.serverTimestamp() });
+    await batch.commit();
+
+    // Notify the other player
+    const otherUid = data.playerA === uid ? data.playerB : data.playerA;
+    if (otherUid) notifyQuickMatchCancelled(otherUid, safeId).catch(() => {});
+
+    return res.json({ message: "Match request cancelled — coins refunded" });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
+});
+
+// Abandon searching (before opponent found) — refunds the waiting player
+app.post("/matches/quick-match/abandon", verifyToken, async (req, res) => {
+  const uid = req.user.uid;
+  const { matchRequestId } = req.body;
+  if (!matchRequestId || typeof matchRequestId !== "string" || !matchRequestId.trim()) {
+    return res.status(400).json({ error: "matchRequestId is required" });
+  }
+  const safeId = matchRequestId.trim();
+  try {
+    const requestRef = db.collection("match_requests").doc(safeId);
+    const requestDoc = await requestRef.get();
+    if (!requestDoc.exists) return res.status(404).json({ error: "Match request not found" });
+    const data = requestDoc.data();
+    if (data.playerA !== uid) return res.status(403).json({ error: "Only the creator can abandon" });
+    if (data.status !== "searching") return res.status(400).json({ error: "Can only abandon while searching" });
+
+    const wt  = validateWalletType(data.walletType);
+    const fee = data.entryFee || 0;
+    const userRef = db.collection("users").doc(uid);
+    const userDoc = await userRef.get();
+
+    const batch = db.batch();
+    if (userDoc.exists && fee > 0) {
+      if (wt === "bonus") {
+        batch.update(userRef, { bonusCoins: inc(Number(userDoc.data().bonusCoins) || 0, fee) });
+      } else {
+        batch.update(userRef, { coins: inc(userDoc.data().coins, fee) });
+      }
+    }
+    batch.update(requestRef, { status: "cancelled", cancelledBy: uid, cancelledAt: admin.firestore.FieldValue.serverTimestamp() });
+    await batch.commit();
+    return res.json({ message: "Search cancelled — coins refunded" });
+  } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
 app.post("/matches/submit-result", verifyToken, async (req, res) => {
@@ -2250,23 +2519,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
 });
 
 // =============================================================
-// DISPUTE ENDPOINT -- SIMPLIFIED FLOW
-//
-// NEW FLOW:
-//   1. Validate reason + optional comment.
-//   2. Create dispute document with status = "pending_evidence".
-//   3. Set match status = "disputed".
-//   4. Start 5-minute server-side timer.
-//   5. Notify both players.
-//   6. Screenshot upload happens SEPARATELY via /dispute/upload-evidence.
-//
-// Dispute document stores:
-//   matchId, playerA, playerB, disputedBy
-//   disputeReason, disputeComment
-//   playerAEvidenceSubmitted, playerBEvidenceSubmitted (booleans)
-//   status, createdAt, disputeOpenedAt, disputeDeadline
-//   submittedScore (match result snapshot)
-//   resolution fields (for admin)
+// DISPUTE ENDPOINT
 // =============================================================
 app.post("/matches/dispute", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2295,97 +2548,37 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       disputeId             = disputeRef.id;
       const now             = admin.firestore.FieldValue.serverTimestamp();
       const disputeDeadline = new Date(Date.now() + DISPUTE_EXPIRY_MS);
-
-      // Create dispute document — evidence upload flags start as false.
-      // Screenshots are uploaded separately via /dispute/upload-evidence.
       t.set(disputeRef, {
-        id:               disputeId,
-        matchId,
-        playerA:          match.playerA,
-        playerB:          match.playerB,
-        disputedBy:       uid,
-        // Reason and comment from the player who filed
-        disputeReason:    validatedReason,
-        disputeComment:   validatedNote,
-        // Evidence submitted flags — updated by /dispute/upload-evidence
-        playerAEvidenceSubmitted: false,
-        playerBEvidenceSubmitted: false,
-        // Legacy fields for backwards compatibility with admin panel
-        playerAReason:    match.playerA === uid ? validatedReason : "",
-        playerAComment:   match.playerA === uid ? validatedNote   : "",
-        playerBReason:    match.playerB === uid ? validatedReason : "",
-        playerBComment:   match.playerB === uid ? validatedNote   : "",
-        // Status
-        status:           "pending_evidence",
-        resolution:       "",
-        resolvedBy:       null,
-        resolvedAt:       null,
-        resolutionNote:   null,
-        // Timing
-        createdAt:        now,
-        disputeOpenedAt:  now,
-        disputeDeadline:  admin.firestore.Timestamp.fromDate(disputeDeadline),
-        // Submitted score snapshot
-        submittedScore:   match.result != null ? match.result : null,
-        submittedBy:      match.submittedBy != null ? match.submittedBy : null,
-        walletType:       match.walletType || "gameplay",
-        // Match snapshot for admin panel
-        matchData: {
-          playerA:     match.playerA,
-          playerB:     match.playerB,
-          game:        match.game,
-          entryFee:    match.entryFee,
-          walletType:  match.walletType || "gameplay",
-          submittedBy: match.submittedBy != null ? match.submittedBy : null,
-          result:      match.result      != null ? match.result      : null,
-        },
-        result: match.result != null ? match.result : null,
-        score:  match.result != null ? match.result : null,
+        id: disputeId, matchId, playerA: match.playerA, playerB: match.playerB, disputedBy: uid,
+        disputeReason: validatedReason, disputeComment: validatedNote,
+        playerAEvidenceSubmitted: false, playerBEvidenceSubmitted: false,
+        playerAReason: match.playerA === uid ? validatedReason : "", playerAComment: match.playerA === uid ? validatedNote : "",
+        playerBReason: match.playerB === uid ? validatedReason : "", playerBComment: match.playerB === uid ? validatedNote : "",
+        status: "pending_evidence", resolution: "", resolvedBy: null, resolvedAt: null, resolutionNote: null,
+        createdAt: now, disputeOpenedAt: now, disputeDeadline: admin.firestore.Timestamp.fromDate(disputeDeadline),
+        submittedScore: match.result != null ? match.result : null, submittedBy: match.submittedBy != null ? match.submittedBy : null,
+        walletType: match.walletType || "gameplay",
+        matchData: { playerA: match.playerA, playerB: match.playerB, game: match.game, entryFee: match.entryFee, walletType: match.walletType || "gameplay", submittedBy: match.submittedBy != null ? match.submittedBy : null, result: match.result != null ? match.result : null },
+        result: match.result != null ? match.result : null, score: match.result != null ? match.result : null,
       });
-
-      t.update(matchRef, {
-        status:     "disputed",
-        disputedAt: now,
-        disputedBy: uid,
-        disputeId,
-      });
+      t.update(matchRef, { status: "disputed", disputedAt: now, disputedBy: uid, disputeId });
     });
-
-    // Verify dispute document was created successfully
     const verifyDisputeDoc = await db.collection("disputes").doc(disputeId).get();
-    if (!verifyDisputeDoc.exists) {
-      console.error("[dispute] CRITICAL: dispute document not found after creation. disputeId=" + disputeId);
-      return res.status(500).json({ error: "Dispute creation failed. Please try again." });
-    }
-
-    // Notify the player who opened the dispute
+    if (!verifyDisputeDoc.exists) { console.error("[dispute] CRITICAL: dispute document not found after creation. disputeId=" + disputeId); return res.status(500).json({ error: "Dispute creation failed. Please try again." }); }
     notifyUser(uid, "match_dispute_opened", "Dispute Submitted", "Your dispute has been submitted. Please upload your screenshot evidence within 5 minutes.", { matchId, disputeId }).catch(() => {});
-
-    // Notify opponent — they need to upload evidence too
     if (opponentUid) {
-      notifyUser(opponentUid, "match_dispute_opened", "Dispute Filed Against You",
-        "Your opponent disputed the result. Please upload your screenshot evidence within 5 minutes.",
-        { matchId, disputeId }).catch(() => {});
-      notifyEvidenceRequired(opponentUid, matchId,
-        new Date(Date.now() + DISPUTE_EXPIRY_MS).toISOString()).catch(() => {});
+      notifyUser(opponentUid, "match_dispute_opened", "Dispute Filed Against You", "Your opponent disputed the result. Please upload your screenshot evidence within 5 minutes.", { matchId, disputeId }).catch(() => {});
+      notifyEvidenceRequired(opponentUid, matchId, new Date(Date.now() + DISPUTE_EXPIRY_MS).toISOString()).catch(() => {});
     }
-
-    // 5-minute auto-close timer
     setTimeout(async () => {
       try {
         const disputeDocSnap = await db.collection("disputes").doc(disputeId).get();
-        if (!disputeDocSnap || !disputeDocSnap.exists) {
-          console.warn("[dispute-timer] Dispute document not found at timer expiry. disputeId=" + disputeId);
-          return;
-        }
+        if (!disputeDocSnap || !disputeDocSnap.exists) { console.warn("[dispute-timer] Dispute document not found at timer expiry. disputeId=" + disputeId); return; }
         const d = disputeDocSnap.data();
         if (!d || d.status !== "pending_evidence") return;
-
         const hasAEvidence = !!(d.playerAEvidenceSubmitted);
         const hasBEvidence = !!(d.playerBEvidenceSubmitted);
-
         if (!hasAEvidence && !hasBEvidence) {
-          // Neither submitted — refund both and apply trust penalties
           const mDoc = await db.collection("matches").doc(matchId).get();
           if (mDoc && mDoc.exists) {
             const mData = mDoc.data();
@@ -2396,48 +2589,27 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
               const bRef = db.collection("users").doc(mData.playerB);
               const [aDoc, bDoc] = await Promise.all([t2.get(aRef), t2.get(bRef)]);
               if (!aDoc.exists || !bDoc.exists) return;
-              if (wt === "bonus") {
-                t2.update(aRef, { bonusCoins: inc(Number(aDoc.data().bonusCoins) || 0, fee) });
-                t2.update(bRef, { bonusCoins: inc(Number(bDoc.data().bonusCoins) || 0, fee) });
-              } else {
-                t2.update(aRef, { coins: inc(aDoc.data().coins, fee) });
-                t2.update(bRef, { coins: inc(bDoc.data().coins, fee) });
-              }
-              t2.update(db.collection("matches").doc(matchId), {
-                status:       "cancelled",
-                cancelledAt:  admin.firestore.FieldValue.serverTimestamp(),
-                cancelReason: "dispute_no_evidence",
-                inviteEnabled: false,
-              });
+              if (wt === "bonus") { t2.update(aRef, { bonusCoins: inc(Number(aDoc.data().bonusCoins) || 0, fee) }); t2.update(bRef, { bonusCoins: inc(Number(bDoc.data().bonusCoins) || 0, fee) }); }
+              else { t2.update(aRef, { coins: inc(aDoc.data().coins, fee) }); t2.update(bRef, { coins: inc(bDoc.data().coins, fee) }); }
+              t2.update(db.collection("matches").doc(matchId), { status: "cancelled", cancelledAt: admin.firestore.FieldValue.serverTimestamp(), cancelReason: "dispute_no_evidence", inviteEnabled: false });
             });
-            await db.collection("disputes").doc(disputeId).update({
-              status:     "closed_no_evidence",
-              resolvedAt: admin.firestore.FieldValue.serverTimestamp(),
-            });
+            await db.collection("disputes").doc(disputeId).update({ status: "closed_no_evidence", resolvedAt: admin.firestore.FieldValue.serverTimestamp() });
             applyStrike(mData.playerA, "No evidence submitted in dispute").catch(() => {});
             applyStrike(mData.playerB, "No evidence submitted in dispute").catch(() => {});
             createTransactionRecord(mData.playerA, "dispute_refund", fee, "Refund: dispute closed (no evidence)", { matchId, disputeId }).catch(() => {});
             createTransactionRecord(mData.playerB, "dispute_refund", fee, "Refund: dispute closed (no evidence)", { matchId, disputeId }).catch(() => {});
           }
         } else {
-          // At least one player submitted evidence — move to awaiting_review
-          await db.collection("disputes").doc(disputeId).update({
-            status:    "awaiting_review",
-            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-          });
-          // Notify both players
+          await db.collection("disputes").doc(disputeId).update({ status: "awaiting_review", updatedAt: admin.firestore.FieldValue.serverTimestamp() });
           const mDoc = await db.collection("matches").doc(matchId).get();
           if (mDoc && mDoc.exists) {
             const mData = mDoc.data();
-            notifyUser(mData.playerA, "dispute_evidence_submitted", "Under Admin Review",
-              "Evidence window closed. An admin will review and decide the outcome.", { matchId, disputeId }).catch(() => {});
-            notifyUser(mData.playerB, "dispute_evidence_submitted", "Under Admin Review",
-              "Evidence window closed. An admin will review and decide the outcome.", { matchId, disputeId }).catch(() => {});
+            notifyUser(mData.playerA, "dispute_evidence_submitted", "Under Admin Review", "Evidence window closed. An admin will review and decide the outcome.", { matchId, disputeId }).catch(() => {});
+            notifyUser(mData.playerB, "dispute_evidence_submitted", "Under Admin Review", "Evidence window closed. An admin will review and decide the outcome.", { matchId, disputeId }).catch(() => {});
           }
         }
       } catch (e) { console.error("[dispute-timer] err:", e.message); }
     }, DISPUTE_EXPIRY_MS);
-
     return res.json({ message: "Dispute submitted successfully", disputeId });
   } catch (err) {
     if (err.message === "NOT_IN_MATCH")      return res.status(403).json({ error: "You are not in this match" });
@@ -2463,8 +2635,6 @@ app.get("/matches/history", verifyToken, async (req, res) => {
 
 // =============================================================
 // DISPUTE RESOLUTION LISTENER
-// Admin sets resolution field in Firestore -> this triggers automatically
-// Handles both "pending_evidence" and "awaiting_review" statuses
 // =============================================================
 function startDisputeResolutionListener() {
   console.log("[dispute-listener] Starting...");
@@ -2479,86 +2649,46 @@ function startDisputeResolutionListener() {
         (async () => {
           try {
             await db.collection("disputes").doc(docId).update({ resolutionProcessed: true, resolutionProcessedAt: admin.firestore.FieldValue.serverTimestamp() });
-            const resolution = data.resolution;
-            const matchId    = data.matchId;
-            const playerA    = data.playerA || (data.matchData && data.matchData.playerA);
-            const playerB    = data.playerB || (data.matchData && data.matchData.playerB);
+            const resolution = data.resolution, matchId = data.matchId;
+            const playerA = data.playerA || (data.matchData && data.matchData.playerA);
+            const playerB = data.playerB || (data.matchData && data.matchData.playerB);
             const disputedBy = data.disputedBy;
             const walletType = validateWalletType((data.matchData && data.matchData.walletType) || "gameplay");
             const isBonus    = walletType === "bonus";
-
-            const matchDoc = await db.collection("matches").doc(matchId).get();
+            const matchDoc   = await db.collection("matches").doc(matchId).get();
             if (!matchDoc.exists) { console.error("[dispute-listener] match not found matchId=" + matchId); return; }
             const match    = matchDoc.data();
             const entryFee = match.entryFee || (data.matchData && data.matchData.entryFee) || 0;
-
-            const aRef = db.collection("users").doc(playerA);
-            const bRef = db.collection("users").doc(playerB);
+            const aRef = db.collection("users").doc(playerA), bRef = db.collection("users").doc(playerB);
             const [aDoc, bDoc] = await Promise.all([aRef.get(), bRef.get()]);
             if (!aDoc.exists || !bDoc.exists) { console.error("[dispute-listener] player docs missing"); return; }
-            const aData = aDoc.data();
-            const bData = bDoc.data();
-
-            const winCoins = winnerReward(entryFee);
-            const winRc    = winnerRc(entryFee);
-            const refund   = isBonus ? entryFee : drawRefund(entryFee);
-
+            const aData = aDoc.data(), bData = bDoc.data();
+            const winCoins = winnerReward(entryFee), winRcAmt = winnerRc(entryFee), refund = isBonus ? entryFee : drawRefund(entryFee);
             if (resolution === "playerA_win") {
-              await aRef.update({
-                coins:            inc(aData.coins, isBonus ? bonusWinnerReward(entryFee) : winCoins),
-                wins:             inc(aData.wins),
-                totalMatches:     inc(aData.totalMatches),
-                completedMatches: inc(aData.completedMatches),
-                ...(!isBonus ? { rcBalance: (Number(aData.rcBalance) || 0) + winRc } : {}),
-              });
-              await db.collection("matches").doc(matchId).update({
-                status: "completed", confirmedWinner: playerA, rewarded: true,
-                disputeResolution: "playerA_win",
-                winnerReward: isBonus ? bonusWinnerReward(entryFee) : winCoins,
-                winnerRc: isBonus ? 0 : winRc,
-                confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
+              await aRef.update({ coins: inc(aData.coins, isBonus ? bonusWinnerReward(entryFee) : winCoins), wins: inc(aData.wins), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches), ...(!isBonus ? { rcBalance: (Number(aData.rcBalance) || 0) + winRcAmt } : {}) });
+              await db.collection("matches").doc(matchId).update({ status: "completed", confirmedWinner: playerA, rewarded: true, disputeResolution: "playerA_win", winnerReward: isBonus ? bonusWinnerReward(entryFee) : winCoins, winnerRc: isBonus ? 0 : winRcAmt, confirmedAt: admin.firestore.FieldValue.serverTimestamp() });
               const bUpdated = Object.assign({}, bData, { disputesLost: inc(bData.disputesLost) });
               await bRef.update({ disputesLost: inc(bData.disputesLost), losses: inc(bData.losses), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches), trustScore: computeTrustScore(bUpdated), fairPlayRating: computeFairPlayRating(bUpdated), matchCompletionRate: computeCompletionRate(bUpdated), trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
               createTransactionRecord(playerA, "dispute_win", isBonus ? bonusWinnerReward(entryFee) : winCoins, "Won dispute: Match Won After Dispute", { matchId, disputeId: docId, walletType }).catch(() => {});
-              if (!isBonus) createTransactionRecord(playerA, "rc_earned", winRc, "RC earned from dispute win", { matchId, disputeId: docId }).catch(() => {});
+              if (!isBonus) createTransactionRecord(playerA, "rc_earned", winRcAmt, "RC earned from dispute win", { matchId, disputeId: docId }).catch(() => {});
               createTransactionRecord(playerB, "dispute_loss", 0, "Dispute loss: Match Lost After Dispute", { matchId, disputeId: docId }).catch(() => {});
-              notifyDisputeWon(playerA, matchId, isBonus ? bonusWinnerReward(entryFee) : winCoins, isBonus ? 0 : winRc).catch(() => {});
+              notifyDisputeWon(playerA, matchId, isBonus ? bonusWinnerReward(entryFee) : winCoins, isBonus ? 0 : winRcAmt).catch(() => {});
               notifyDisputeLost(playerB, matchId).catch(() => {});
               applyStrike(playerB, "Lost dispute — dishonest result submission").catch(() => {});
-
             } else if (resolution === "playerB_win") {
-              await bRef.update({
-                coins:            inc(bData.coins, isBonus ? bonusWinnerReward(entryFee) : winCoins),
-                wins:             inc(bData.wins),
-                totalMatches:     inc(bData.totalMatches),
-                completedMatches: inc(bData.completedMatches),
-                ...(!isBonus ? { rcBalance: (Number(bData.rcBalance) || 0) + winRc } : {}),
-              });
-              await db.collection("matches").doc(matchId).update({
-                status: "completed", confirmedWinner: playerB, rewarded: true,
-                disputeResolution: "playerB_win",
-                winnerReward: isBonus ? bonusWinnerReward(entryFee) : winCoins,
-                winnerRc: isBonus ? 0 : winRc,
-                confirmedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
+              await bRef.update({ coins: inc(bData.coins, isBonus ? bonusWinnerReward(entryFee) : winCoins), wins: inc(bData.wins), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches), ...(!isBonus ? { rcBalance: (Number(bData.rcBalance) || 0) + winRcAmt } : {}) });
+              await db.collection("matches").doc(matchId).update({ status: "completed", confirmedWinner: playerB, rewarded: true, disputeResolution: "playerB_win", winnerReward: isBonus ? bonusWinnerReward(entryFee) : winCoins, winnerRc: isBonus ? 0 : winRcAmt, confirmedAt: admin.firestore.FieldValue.serverTimestamp() });
               const aUpdated = Object.assign({}, aData, { disputesLost: inc(aData.disputesLost) });
               await aRef.update({ disputesLost: inc(aData.disputesLost), losses: inc(aData.losses), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches), trustScore: computeTrustScore(aUpdated), fairPlayRating: computeFairPlayRating(aUpdated), matchCompletionRate: computeCompletionRate(aUpdated), trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
               createTransactionRecord(playerB, "dispute_win", isBonus ? bonusWinnerReward(entryFee) : winCoins, "Won dispute: Match Won After Dispute", { matchId, disputeId: docId, walletType }).catch(() => {});
-              if (!isBonus) createTransactionRecord(playerB, "rc_earned", winRc, "RC earned from dispute win", { matchId, disputeId: docId }).catch(() => {});
+              if (!isBonus) createTransactionRecord(playerB, "rc_earned", winRcAmt, "RC earned from dispute win", { matchId, disputeId: docId }).catch(() => {});
               createTransactionRecord(playerA, "dispute_loss", 0, "Dispute loss: Match Lost After Dispute", { matchId, disputeId: docId }).catch(() => {});
-              notifyDisputeWon(playerB, matchId, isBonus ? bonusWinnerReward(entryFee) : winCoins, isBonus ? 0 : winRc).catch(() => {});
+              notifyDisputeWon(playerB, matchId, isBonus ? bonusWinnerReward(entryFee) : winCoins, isBonus ? 0 : winRcAmt).catch(() => {});
               notifyDisputeLost(playerA, matchId).catch(() => {});
               applyStrike(playerA, "Lost dispute — dishonest result submission").catch(() => {});
-
             } else if (resolution === "refund_both") {
-              if (isBonus) {
-                await aRef.update({ bonusCoins: inc(Number(aData.bonusCoins) || 0, entryFee), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches) });
-                await bRef.update({ bonusCoins: inc(Number(bData.bonusCoins) || 0, entryFee), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches) });
-              } else {
-                await aRef.update({ coins: inc(aData.coins, refund), draws: inc(aData.draws), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches) });
-                await bRef.update({ coins: inc(bData.coins, refund), draws: inc(bData.draws), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches) });
-              }
+              if (isBonus) { await aRef.update({ bonusCoins: inc(Number(aData.bonusCoins) || 0, entryFee), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches) }); await bRef.update({ bonusCoins: inc(Number(bData.bonusCoins) || 0, entryFee), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches) }); }
+              else { await aRef.update({ coins: inc(aData.coins, refund), draws: inc(aData.draws), totalMatches: inc(aData.totalMatches), completedMatches: inc(aData.completedMatches) }); await bRef.update({ coins: inc(bData.coins, refund), draws: inc(bData.draws), totalMatches: inc(bData.totalMatches), completedMatches: inc(bData.completedMatches) }); }
               await db.collection("matches").doc(matchId).update({ status: "completed", confirmedWinner: "draw", rewarded: true, disputeResolution: "refund_both", confirmedAt: admin.firestore.FieldValue.serverTimestamp() });
               const aUp = Object.assign({}, aData, { disputesLost: inc(aData.disputesLost) });
               const bUp = Object.assign({}, bData, { disputesLost: inc(bData.disputesLost) });
@@ -2566,23 +2696,14 @@ function startDisputeResolutionListener() {
               await bRef.update({ disputesLost: inc(bData.disputesLost), trustScore: computeTrustScore(bUp), fairPlayRating: computeFairPlayRating(bUp), trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
               createTransactionRecord(playerA, "dispute_refund", refund, "Refund After Dispute", { matchId, disputeId: docId, walletType }).catch(() => {});
               createTransactionRecord(playerB, "dispute_refund", refund, "Refund After Dispute", { matchId, disputeId: docId, walletType }).catch(() => {});
-              notifyDisputeRefund(playerA, matchId, refund).catch(() => {});
-              notifyDisputeRefund(playerB, matchId, refund).catch(() => {});
-              applyStrike(playerA, "Dispute resulted in refund for both players").catch(() => {});
-              applyStrike(playerB, "Dispute resulted in refund for both players").catch(() => {});
-
+              notifyDisputeRefund(playerA, matchId, refund).catch(() => {}); notifyDisputeRefund(playerB, matchId, refund).catch(() => {});
+              applyStrike(playerA, "Dispute resulted in refund for both players").catch(() => {}); applyStrike(playerB, "Dispute resulted in refund for both players").catch(() => {});
             } else if (resolution === "reject_dispute") {
               const aUp = Object.assign({}, aData, { disputesLost: inc(aData.disputesLost) });
-              await (disputedBy === playerA ? aRef : bRef).update({
-                disputesLost:   inc((disputedBy === playerA ? aData : bData).disputesLost),
-                trustScore:     computeTrustScore(aUp),
-                fairPlayRating: computeFairPlayRating(aUp),
-                trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-              });
+              await (disputedBy === playerA ? aRef : bRef).update({ disputesLost: inc((disputedBy === playerA ? aData : bData).disputesLost), trustScore: computeTrustScore(aUp), fairPlayRating: computeFairPlayRating(aUp), trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() });
               createTransactionRecord(disputedBy, "dispute_rejected", 0, "Dispute Rejected — False dispute penalty", { matchId, disputeId: docId }).catch(() => {});
               applyStrike(disputedBy, "False or invalid dispute submitted").catch(() => {});
             }
-
             await db.collection("disputes").doc(docId).update({ status: "resolved", resolvedAt: admin.firestore.FieldValue.serverTimestamp() });
             console.log("[dispute-listener] resolved docId=" + docId + " resolution=" + resolution);
           } catch (err) { console.error("[dispute-listener] Error processing docId=" + docId + ":", err.message); }
@@ -2626,8 +2747,7 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
     });
     if (matchSnapshot && !result.alreadyResolved && !result.alreadyCancelled) {
       const w = result.confirmedWinner, mid = matchSnapshot.id || matchId, ef = matchSnapshot.entryFee, wt = validateWalletType(matchSnapshot.walletType);
-      notifyAutoResolved(matchSnapshot.playerA, mid, w).catch(() => {});
-      notifyAutoResolved(matchSnapshot.playerB, mid, w).catch(() => {});
+      notifyAutoResolved(matchSnapshot.playerA, mid, w).catch(() => {}); notifyAutoResolved(matchSnapshot.playerB, mid, w).catch(() => {});
       if (wt === "bonus") {
         if (w === "draw") { const r = bonusDrawRefund(ef); [matchSnapshot.playerA, matchSnapshot.playerB].forEach((p) => { notifyBonusMatchDraw(p, mid, r).catch(() => {}); createTransactionRecord(p, "bonus_match_draw", r, "Bonus match draw (auto-resolved)", { matchId: mid, walletType: "bonus" }).catch(() => {}); }); }
         else { const lu = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA, bw = bonusWinnerReward(ef); notifyBonusMatchWon(w, mid, bw).catch(() => {}); notifyBonusMatchLost(lu, mid).catch(() => {}); createTransactionRecord(w, "bonus_match_won", bw, "Bonus match won (auto-resolved)", { matchId: mid, walletType: "bonus" }).catch(() => {}); createTransactionRecord(lu, "bonus_match_lost", 0, "Bonus match lost (auto-resolved)", { matchId: mid, walletType: "bonus" }).catch(() => {}); }
@@ -2656,16 +2776,14 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       if (match.status !== "active") throw new Error("Cannot auto-cancel -- status is \"" + match.status + "\"");
       if (hasSubmittedResult(match)) throw new Error("Result submitted -- use auto-resolve");
       matchSnapshot = match;
-      const aRef = db.collection("users").doc(match.playerA);
-      const bRef = db.collection("users").doc(match.playerB);
+      const aRef = db.collection("users").doc(match.playerA), bRef = db.collection("users").doc(match.playerB);
       const wt   = validateWalletType(match.walletType);
       const [aDoc, bDoc] = await Promise.all([t.get(aRef), t.get(bRef)]);
       if (!aDoc.exists || !bDoc.exists) throw new Error("Player data not found");
       const aData = aDoc.data(), bData = bDoc.data();
       if (wt === "bonus") { t.update(aRef, { bonusCoins: inc(Number(aData.bonusCoins) || 0, match.entryFee) }); t.update(bRef, { bonusCoins: inc(Number(bData.bonusCoins) || 0, match.entryFee) }); }
       else { t.update(aRef, { coins: inc(aData.coins, match.entryFee) }); t.update(bRef, { coins: inc(bData.coins, match.entryFee) }); }
-      const aUp = Object.assign({}, aData, { rageQuits: inc(aData.rageQuits) });
-      const bUp = Object.assign({}, bData, { rageQuits: inc(bData.rageQuits) });
+      const aUp = Object.assign({}, aData, { rageQuits: inc(aData.rageQuits) }), bUp = Object.assign({}, bData, { rageQuits: inc(bData.rageQuits) });
       t.update(aRef, { rageQuits: inc(aData.rageQuits) }); t.update(bRef, { rageQuits: inc(bData.rageQuits) });
       applyTrustUpdate(t, aRef, aUp); applyTrustUpdate(t, bRef, bUp);
       t.update(matchRef, { status: "cancelled", cancelledAt: admin.firestore.FieldValue.serverTimestamp(), autoCancelled: true, cancelReason: "match_timer_expired_no_submission", inviteEnabled: false });
@@ -2723,8 +2841,7 @@ app.post("/matches/rematch-respond", verifyToken, async (req, res) => {
       if (match.rematchStatus !== "pending")  throw new Error("No pending rematch");
       if (match.rematchRequestedBy === uid)   throw new Error("Cannot accept own rematch request");
       playerAUid = match.playerA; playerBUid = match.playerB;
-      const aRef = db.collection("users").doc(match.playerA);
-      const bRef = db.collection("users").doc(match.playerB);
+      const aRef = db.collection("users").doc(match.playerA), bRef = db.collection("users").doc(match.playerB);
       const wt   = validateWalletType(match.walletType);
       const [aDoc, bDoc] = await Promise.all([t.get(aRef), t.get(bRef)]);
       if (wt === "bonus") {
@@ -2790,8 +2907,7 @@ app.post("/report", verifyToken, async (req, res) => {
     await reportRef.set({ id: reportRef.id, reporterUid, reportedUid, description: description.trim().substring(0, 500), status: "pending", createdAt: admin.firestore.FieldValue.serverTimestamp() });
     db.collection("users").doc(reportedUid).get().then((doc) => {
       if (!doc.exists) return;
-      const data    = doc.data();
-      const updated = Object.assign({}, data, { reportsReceived: inc(data.reportsReceived) });
+      const data = doc.data(), updated = Object.assign({}, data, { reportsReceived: inc(data.reportsReceived) });
       doc.ref.update({ reportsReceived: inc(data.reportsReceived) }).catch(() => {});
       doc.ref.set({ trustScore: computeTrustScore(updated), matchCompletionRate: computeCompletionRate(updated), fairPlayRating: computeFairPlayRating(updated), trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true }).catch(() => {});
     }).catch(() => {});
@@ -2820,24 +2936,12 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       const batch = db.batch();
       snap.docs.forEach((doc) => {
         try {
-          const data = doc.data();
-          const detected = detectCountryFromPhone(data.phone || "");
-          const updateFields = {
-            trustScore: computeTrustScore(data), fairPlayRating: computeFairPlayRating(data), matchCompletionRate: computeCompletionRate(data),
-            rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0,
-            firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false,
-            strikeCount: data.strikeCount !== undefined ? data.strikeCount : 0,
-            isBanned:  data.isBanned  !== undefined ? data.isBanned  : false,
-            banReason: data.banReason !== undefined ? data.banReason : "",
-            trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(),
-            ...(!data.country  ? { country:  detected.country  } : {}),
-            ...(!data.currency ? { currency: detected.currency } : {}),
-          };
+          const data = doc.data(), detected = detectCountryFromPhone(data.phone || "");
+          const updateFields = { trustScore: computeTrustScore(data), fairPlayRating: computeFairPlayRating(data), matchCompletionRate: computeCompletionRate(data), rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, strikeCount: data.strikeCount !== undefined ? data.strikeCount : 0, isBanned: data.isBanned !== undefined ? data.isBanned : false, banReason: data.banReason !== undefined ? data.banReason : "", trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), ...(!data.country ? { country: detected.country } : {}), ...(!data.currency ? { currency: detected.currency } : {}) };
           if (!data.lastSeen) updateFields.lastSeen = admin.firestore.FieldValue.serverTimestamp();
           if (data.bonusMatchUsed !== undefined)      updateFields.bonusMatchUsed = admin.firestore.FieldValue.delete();
           if (data.firstMatchBonusUsed !== undefined) updateFields.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
-          batch.set(doc.ref, updateFields, { merge: true });
-          migrated++;
+          batch.set(doc.ref, updateFields, { merge: true }); migrated++;
         } catch (e) { errors++; }
       });
       await batch.commit();
@@ -2854,27 +2958,21 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
 app.post("/admin/migrate-country-currency", verifyToken, async (req, res) => {
   let migrated = 0, skipped = 0, errors = 0;
   try {
-    const PAGE = 100;
-    let lastDoc = null, hasMore = true;
+    const PAGE = 100; let lastDoc = null, hasMore = true;
     while (hasMore) {
       let query = db.collection("users").limit(PAGE);
       if (lastDoc) query = query.startAfter(lastDoc);
       const snap = await query.get();
       if (snap.empty) { hasMore = false; break; }
-      const batch = db.batch();
-      let batchWrites = 0;
+      const batch = db.batch(); let batchWrites = 0;
       snap.docs.forEach((doc) => {
         try {
-          const data = doc.data();
-          const needsCountry  = !data.country  || data.country  === "Unknown";
-          const needsCurrency = !data.currency || data.currency === "Unknown";
+          const data = doc.data(), needsCountry = !data.country || data.country === "Unknown", needsCurrency = !data.currency || data.currency === "Unknown";
           if (!needsCountry && !needsCurrency) { skipped++; return; }
-          const detected = detectCountryFromPhone(data.phone || "");
-          const patch = {};
+          const detected = detectCountryFromPhone(data.phone || ""), patch = {};
           if (needsCountry)  patch.country  = detected.country;
           if (needsCurrency) patch.currency = detected.currency;
-          batch.set(doc.ref, patch, { merge: true });
-          batchWrites++; migrated++;
+          batch.set(doc.ref, patch, { merge: true }); batchWrites++; migrated++;
         } catch (e) { errors++; }
       });
       if (batchWrites > 0) await batch.commit();

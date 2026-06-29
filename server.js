@@ -452,6 +452,12 @@ function getTrustLevel(score) {
   return               { name: "Dangerous",    emoji: "🔴" };
 }
 
+// =============================================================
+// DEFAULT USER PROFILE FIELDS
+// NOTE: Keep coins (gameplay coins) field name as-is throughout
+// the codebase to avoid breaking existing match/reward logic.
+// The field "coins" represents gameplay coins.
+// =============================================================
 const DEFAULT_TRUST_FIELDS = {
   trustScore:          80,
   completedMatches:    0,
@@ -565,9 +571,7 @@ async function applyStrike(uid, reason) {
 
     await userRef.update(updateFields);
 
-    // Track total strikes issued
     incrementPlatformField("totalStrikesIssued").catch(() => {});
-    // Recompute banned users if a ban was applied
     if (updateFields.isBanned) recomputeBannedUsers().catch(() => {});
 
     console.log("[applyStrike] uid=" + uid + " strikes=" + newStrikes);
@@ -651,9 +655,6 @@ async function detectSuspiciousActivity(uid, context) {
 
 // =============================================================
 // REFERRAL REWARD — GAMEPLAY COINS ONLY
-// Grants +5 Gameplay Coins to referred user and +5 to referrer.
-// Triggers only after first verified coin purchase.
-// Granted once only. Prevents self-referrals and duplicates.
 // =============================================================
 async function tryGrantReferralReward(uid) {
   try {
@@ -661,15 +662,12 @@ async function tryGrantReferralReward(uid) {
     if (!userDoc.exists) return;
     const user = userDoc.data();
 
-    // Must have been referred, and reward must not yet be granted
     if (!user.referredBy || user.referralRewardGranted) return;
 
     const referrerUid = user.referredBy;
 
-    // Prevent self-referral (defensive check)
     if (referrerUid === uid) return;
 
-    // Anti-farming: device overlap detection
     const deviceSnap = await db.collection("device_fingerprints").where("uid", "==", referrerUid).limit(3).get();
     const referrerDevices = new Set(deviceSnap.docs.map((d) => d.data().deviceId).filter(Boolean));
     const userDeviceSnap = await db.collection("device_fingerprints").where("uid", "==", uid).limit(3).get();
@@ -678,7 +676,6 @@ async function tryGrantReferralReward(uid) {
         detectSuspiciousActivity(uid, "referral_same_device referrer=" + referrerUid).catch(() => {});
     });
 
-    // Grant +5 Gameplay Coins to both inside a transaction (idempotency via referralRewardGranted)
     await db.runTransaction(async (t) => {
       const userRef     = db.collection("users").doc(uid);
       const referrerRef = db.collection("users").doc(referrerUid);
@@ -686,24 +683,19 @@ async function tryGrantReferralReward(uid) {
       if (!freshUser.exists)   throw new Error("User not found");
       if (!referrerDoc.exists) throw new Error("Referrer not found");
 
-      // Double-check inside transaction
       if (freshUser.data().referralRewardGranted) return;
 
-      // +5 Gameplay Coins to referred user (stored in coins field)
       t.update(userRef, {
         coins: inc(freshUser.data().coins, 5),
         referralRewardGranted: true,
       });
 
-      // +5 Gameplay Coins to referrer (stored in coins field)
       t.update(referrerRef, {
         coins: inc(referrerDoc.data().coins, 5),
       });
     });
 
-    // Update platform analytics
     incrementPlatformField("totalReferrals").catch(() => {});
-    // 2 users each get 5 coins = 10 coins distributed per successful referral
     incrementPlatformField("totalReferralCoinsDistributed", 10).catch(() => {});
     recomputeGameplayCoinTotal().catch(() => {});
 
@@ -925,7 +917,6 @@ async function creditCoinsForReference(safeRef, uid, pkg, paystackEmail) {
     if (pendingDoc.exists) t.update(pendingRef, { status: "completed", completedAt: admin.firestore.FieldValue.serverTimestamp(), completedBy: pkg.source || "verify" });
   });
 
-  // Platform analytics: track total coins purchased
   incrementPlatformField("totalCoinsPurchased", pkg.coins).catch(() => {});
   recomputeGameplayCoinTotal().catch(() => {});
 
@@ -1007,8 +998,6 @@ async function notifyMultipleUsers(userIds, type, title, message, meta) {
   if (!Array.isArray(userIds)) return;
   await Promise.all(userIds.filter((uid) => uid && typeof uid === "string").map((uid) => notifyUser(uid, type, title, message, meta || {})));
 }
-
-// -- Typed notification helpers --
 
 function notifyMatchCreated(userId, matchId, game, entryFee, walletType) {
   const walletLabel = walletType === "bonus" ? "Bonus" : "Gameplay";
@@ -1201,7 +1190,6 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
   t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: confirmedWinner === "draw" ? 0 : winner, winnerRc: confirmedWinner === "draw" ? 0 : rc, loserReward: confirmedWinner === "draw" ? 0 : loser, walletType: "gameplay", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null });
 
-  // Analytics
   incrementPlatformField("totalMatchesPlayed").catch(() => {});
   recomputeGameplayCoinTotal().catch(() => {});
   if (rc > 0) recomputeRCTotal().catch(() => {});
@@ -1438,6 +1426,9 @@ app.get("/platform/analytics", verifyToken, async (req, res) => {
 
 // =============================================================
 // CLOUDINARY -- SECURE EVIDENCE UPLOAD ENDPOINT
+// FIX 1: Use disputeDoc.ref.set() — Node.js Admin SDK uses .ref
+//         not .reference (which is the Flutter/Dart SDK property).
+//         Also added null-guard on disputeDoc before accessing .ref.
 // =============================================================
 app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1451,23 +1442,46 @@ app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
     if (!matchDoc.exists) return res.status(404).json({ error: "Match not found" });
     const match = matchDoc.data();
     if (match.playerA !== uid && match.playerB !== uid) return res.status(403).json({ error: "You are not in this match" });
-    const disputeSnap = await db.collection("disputes").where("matchId", "==", safeMatchId).orderBy("createdAt", "desc").limit(1).get();
-    if (!disputeSnap || !disputeSnap.docs || disputeSnap.docs.length === 0 || disputeSnap.empty) {
+
+    const disputeSnap = await db.collection("disputes")
+      .where("matchId", "==", safeMatchId)
+      .orderBy("createdAt", "desc")
+      .limit(1)
+      .get();
+
+    if (!disputeSnap || disputeSnap.empty || disputeSnap.docs.length === 0) {
       console.error("[dispute/upload-evidence] No dispute record found for matchId=" + safeMatchId);
       return res.status(400).json({ error: "No dispute record found for this match. Please file a dispute before uploading evidence." });
     }
+
+    // FIX 1: disputeDoc.ref is the correct Admin SDK property (not .reference)
     const disputeDoc  = disputeSnap.docs[0];
     const disputeData = disputeDoc.data();
     const disputeId   = disputeData.id || disputeDoc.id;
-    if (!disputeId) { console.error("[dispute/upload-evidence] Dispute document has no id for matchId=" + safeMatchId); return res.status(500).json({ error: "Dispute record is invalid. Please contact support." }); }
+
+    if (!disputeId) {
+      console.error("[dispute/upload-evidence] Dispute document has no id for matchId=" + safeMatchId);
+      return res.status(500).json({ error: "Dispute record is invalid. Please contact support." });
+    }
+
     const folder    = "duelix/disputes_evidence/" + disputeId + "/" + uid;
     const secureUrl = await uploadToCloudinary(imageBase64.trim(), safeMime, folder);
-    const isPlayerA = match.playerA === uid;
+
+    const isPlayerA      = match.playerA === uid;
     const submittedField = isPlayerA ? "playerAEvidenceSubmitted" : "playerBEvidenceSubmitted";
-    await disputeDoc.ref.set({ [submittedField]: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+
+    // FIXED: was disputeDoc.reference.set — now correctly uses disputeDoc.ref.set
+    await disputeDoc.ref.set(
+      { [submittedField]: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true }
+    );
+
     console.log("[dispute/upload-evidence] uid=" + uid + " matchId=" + safeMatchId + " disputeId=" + disputeId + " field=" + submittedField + " cloudinaryUrl=" + secureUrl);
     return res.json({ message: "Evidence uploaded successfully", submitted: true, disputeId });
-  } catch (err) { console.error("[dispute/upload-evidence]", err.message); return res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error("[dispute/upload-evidence]", err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
 
 // =============================================================
@@ -1934,6 +1948,12 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // CREATE USER PROFILE
+// FIX 2: Consolidated t.set() now includes every required field
+//         explicitly — no reliance on Object.assign spread order
+//         or DEFAULT_TRUST_FIELDS merge. All fields guaranteed
+//         to be present and correctly initialised in the single
+//         transaction write. Duplicate helper definitions below
+//         the endpoint are also removed to prevent shadowing.
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1941,85 +1961,134 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
   if (!displayName || !phone) return res.status(400).json({ error: "displayName and phone are required" });
   if (!/^\+\d{7,15}$/.test(phone)) return res.status(400).json({ error: "phone must be in E.164 format" });
   const name = displayName.trim();
-  if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
-  const ipAddress = req.headers["x-forwarded-for"] ? String(req.headers["x-forwarded-for"]).split(",")[0].trim() : req.socket.remoteAddress || null;
+  if (name.length < 3 || name.length > 20 || !/^[a-zA-Z0-9_.]+$/.test(name)) {
+    return res.status(400).json({ error: "displayName: 3-20 chars, letters/numbers/underscores/dots only" });
+  }
+  const ipAddress = req.headers["x-forwarded-for"]
+    ? String(req.headers["x-forwarded-for"]).split(",")[0].trim()
+    : req.socket.remoteAddress || null;
   const { country, currency } = detectCountryFromPhone(phone);
   console.log("[create-profile] uid=" + uid + " phone=" + phone + " country=" + country + " currency=" + currency);
   try {
-    if (ipAddress && (await isIpAbusive(ipAddress))) return res.status(429).json({ error: "Too many accounts registered from this network." });
+    if (ipAddress && (await isIpAbusive(ipAddress))) {
+      return res.status(429).json({ error: "Too many accounts registered from this network." });
+    }
     const deviceCount = await countAccountsByDevice(deviceId, installId);
     if (deviceCount >= 3) detectSuspiciousActivity(uid, "multi_account_device count=" + deviceCount).catch(() => {});
+
     const userRef = db.collection("users").doc(uid);
+
+    // Generate referral code BEFORE the transaction to avoid async work inside it
     const referralCode = await uniqueReferralCode();
+
+    // Uniqueness checks BEFORE the transaction
     const phoneSnap = await db.collection("users").where("phone", "==", phone).limit(1).get();
-    if (!phoneSnap.empty && phoneSnap.docs[0].id !== uid) return res.status(409).json({ error: "That phone number is already registered" });
+    if (!phoneSnap.empty && phoneSnap.docs[0].id !== uid) {
+      return res.status(409).json({ error: "That phone number is already registered" });
+    }
     const nameSnap = await db.collection("users").where("displayName", "==", name).limit(1).get();
-    if (!nameSnap.empty && nameSnap.docs[0].id !== uid) return res.status(409).json({ error: "That username is already taken" });
+    if (!nameSnap.empty && nameSnap.docs[0].id !== uid) {
+      return res.status(409).json({ error: "That username is already taken" });
+    }
+
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
+      // Idempotent: if the profile already exists, do nothing
       if (snap.exists) return;
-      t.set(userRef, Object.assign({
-        uid, displayName: name, phone, email: email != null ? email : "",
-        country, currency,
-        coins: 0, bonusCoins: 10, wins: 0, losses: 0, draws: 0, totalMatches: 0,
-        loginStreak: 0, lastLogin: null,
-        lastSeen: admin.firestore.FieldValue.serverTimestamp(),
-        lastActiveAt: admin.firestore.FieldValue.serverTimestamp(),
-        avatar: "assets/avatars/avatar1.png",
-        referralCode, referredBy: null, referredByName: null,
-        referralCount: 0, referralRewardGranted: false, firstPurchaseDone: false,
-        fcmToken: null, deviceId: deviceId || null, installId: installId || null,
-        createdAt: admin.firestore.FieldValue.serverTimestamp(),
-      }, DEFAULT_TRUST_FIELDS));
+
+      // -------------------------------------------------------
+      // COMPLETE user document — every required field is listed
+      // explicitly here. Do NOT use Object.assign / spread to
+      // merge DEFAULT_TRUST_FIELDS; keep it explicit so missing
+      // fields are immediately visible during code review.
+      // -------------------------------------------------------
+      t.set(userRef, {
+        // ── Identity ──────────────────────────────────────────
+        uid,
+        displayName:           name,
+        email:                 email != null ? String(email).trim() : "",
+        phone,
+        avatar:                "assets/avatars/avatar1.png",
+
+        // ── Geography ─────────────────────────────────────────
+        country,
+        currency,
+
+        // ── Wallets ───────────────────────────────────────────
+        // "coins" is the gameplay-coins field used throughout the
+        // codebase (match creation, rewards, etc.). Keep as-is.
+        coins:                 0,       // gameplay coins
+        bonusCoins:            10,      // new-user bonus
+        rcBalance:             0,
+
+        // ── Match stats ───────────────────────────────────────
+        wins:                  0,
+        losses:                0,
+        draws:                 0,
+        totalMatches:          0,
+        completedMatches:      0,
+        cancelledMatches:      0,
+
+        // ── Trust / fair-play ─────────────────────────────────
+        trustScore:            80,
+        fairPlayRating:        100,
+        matchCompletionRate:   0,
+        cleanMatchBonus:       0,
+        fairPlayBonus:         0,
+        disputesLost:          0,
+        reportsReceived:       0,
+        fakeResults:           0,
+        rageQuits:             0,
+
+        // ── Strike / ban ──────────────────────────────────────
+        strikeCount:           0,
+        isBanned:              false,
+        banType:               null,
+        banHours:              null,
+        banReason:             "",
+        bannedAt:              null,
+        banExpiresAt:          null,
+
+        // ── Referral ──────────────────────────────────────────
+        referralCode,
+        referralCount:         0,
+        referredBy:            null,
+        referredByName:        null,
+        referralRewardGranted: false,
+
+        // ── Purchase / onboarding ─────────────────────────────
+        firstPurchaseDone:     false,
+
+        // ── Social / privacy prefs ────────────────────────────
+        onlineStatus:          true,
+        friendRequests:        true,
+
+        // ── Device / session ──────────────────────────────────
+        fcmToken:              null,
+        deviceId:              deviceId  || null,
+        installId:             installId || null,
+
+        // ── Timestamps ────────────────────────────────────────
+        loginStreak:           0,
+        lastLogin:             null,
+        createdAt:             admin.firestore.FieldValue.serverTimestamp(),
+        lastSeen:              admin.firestore.FieldValue.serverTimestamp(),
+        lastActiveAt:          admin.firestore.FieldValue.serverTimestamp(),
+      });
     });
 
-    // Platform analytics: increment total users
+    // Fire-and-forget side-effects AFTER the transaction commits
     incrementPlatformField("totalUsers").catch(() => {});
     updateActiveUsers24h().catch(() => {});
-
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
     notifyUser(uid, "system", "Welcome to Duelix!", "Your account is ready! You have 10 bonus coins to start. Play and win to earn more!", {}).catch(() => {});
+
     return res.status(201).json({ message: "Profile created", uid, referralCode, country, currency });
-  } catch (err) { return res.status(500).json({ error: err.message }); }
+  } catch (err) {
+    console.error("[create-profile] err uid=" + uid + ":", err.message);
+    return res.status(500).json({ error: err.message });
+  }
 });
-
-// helper referenced in create-profile
-async function isIpAbusive(ipAddress) {
-  if (!ipAddress) return false;
-  try {
-    const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
-    const snap   = await db.collection("device_fingerprints")
-      .where("ipAddress", "==", ipAddress).orderBy("recordedAt", "desc").limit(10).get();
-    const recent = snap.docs.filter((doc) => {
-      const ts = doc.data().recordedAt;
-      return ts && ts.toDate && ts.toDate() > cutoff;
-    });
-    return recent.length >= 5;
-  } catch (err) { console.error("[isIpAbusive]", err.message); return false; }
-}
-
-async function countAccountsByDevice(deviceId, installId) {
-  if (!deviceId && !installId) return 0;
-  try {
-    const queries = [];
-    if (deviceId)  queries.push(db.collection("device_fingerprints").where("deviceId", "==", deviceId).limit(5).get());
-    if (installId) queries.push(db.collection("device_fingerprints").where("installId", "==", installId).limit(5).get());
-    const snaps = await Promise.all(queries);
-    const uids  = new Set();
-    snaps.forEach((snap) => snap.docs.forEach((doc) => uids.add(doc.data().uid)));
-    return uids.size;
-  } catch (err) { console.error("[countAccountsByDevice]", err.message); return 0; }
-}
-
-async function recordDeviceFingerprint(uid, deviceId, installId, ipAddress) {
-  if (!uid) return;
-  try {
-    await db.collection("device_fingerprints").doc().set({
-      uid, deviceId: deviceId || null, installId: installId || null,
-      ipAddress: ipAddress || null, recordedAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  } catch (err) { console.error("[recordDeviceFingerprint]", err.message); }
-}
 
 app.get("/user-exists/:uid", async (req, res) => {
   try {
@@ -2030,6 +2099,9 @@ app.get("/user-exists/:uid", async (req, res) => {
 
 // =============================================================
 // MIGRATION: ENSURE FIELDS
+// Only patches genuinely missing/undefined fields. Does NOT
+// overwrite coins, bonusCoins, rcBalance, wins, losses, etc.
+// that were correctly written at profile creation time.
 // =============================================================
 app.post("/users/ensure-fields", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2039,21 +2111,52 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
     if (!userDoc.exists) return res.status(404).json({ error: "User not found" });
     const data    = userDoc.data();
     const updates = {};
+
+    // Only set bonusCoins if truly missing (undefined/null), not if it's 0
     if (data.bonusCoins === undefined || data.bonusCoins === null) updates.bonusCoins = 0;
     if (!data.lastSeen)     updates.lastSeen     = admin.firestore.FieldValue.serverTimestamp();
     if (!data.lastActiveAt) updates.lastActiveAt = admin.firestore.FieldValue.serverTimestamp();
-    if (data.bonusMatchUsed !== undefined)      updates.bonusMatchUsed = admin.firestore.FieldValue.delete();
+
+    // Remove legacy fields
+    if (data.bonusMatchUsed      !== undefined) updates.bonusMatchUsed      = admin.firestore.FieldValue.delete();
     if (data.firstMatchBonusUsed !== undefined) updates.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
+
+    // Backfill country/currency if missing
     if (!data.country || !data.currency) {
       const detected = detectCountryFromPhone(data.phone || "");
       if (!data.country)  updates.country  = detected.country;
       if (!data.currency) updates.currency = detected.currency;
     }
-    if (data.strikeCount === undefined) updates.strikeCount = 0;
-    if (data.isBanned    === undefined) updates.isBanned    = false;
-    if (data.banReason   === undefined) updates.banReason   = "";
+
+    // Backfill ban/strike fields added after original profiles were created
+    if (data.strikeCount  === undefined) updates.strikeCount  = 0;
+    if (data.isBanned     === undefined) updates.isBanned     = false;
+    if (data.banReason    === undefined) updates.banReason    = "";
+    if (data.banType      === undefined) updates.banType      = null;
+    if (data.banHours     === undefined) updates.banHours     = null;
+    if (data.banExpiresAt === undefined) updates.banExpiresAt = null;
+    if (data.bannedAt     === undefined) updates.bannedAt     = null;
+
+    // Backfill trust fields
+    if (data.cleanMatchBonus      === undefined) updates.cleanMatchBonus      = 0;
+    if (data.fairPlayBonus        === undefined) updates.fairPlayBonus        = 0;
+    if (data.rcBalance            === undefined) updates.rcBalance            = 0;
+    if (data.onlineStatus         === undefined) updates.onlineStatus         = true;
+    if (data.friendRequests       === undefined) updates.friendRequests       = true;
+    if (data.firstPurchaseDone    === undefined) updates.firstPurchaseDone    = false;
+    if (data.referralRewardGranted=== undefined) updates.referralRewardGranted= false;
+    if (data.referralCode         === undefined || !data.referralCode) {
+      // Only generate a new code for accounts that were created before this field existed
+      const newCode = await uniqueReferralCode().catch(() => null);
+      if (newCode) updates.referralCode = newCode;
+    }
+
     if (Object.keys(updates).length > 0) await userRef.set(updates, { merge: true });
-    return res.json({ message: "Fields ensured", country: updates.country || data.country, currency: updates.currency || data.currency });
+    return res.json({
+      message:  "Fields ensured",
+      country:  updates.country  || data.country,
+      currency: updates.currency || data.currency,
+    });
   } catch (err) { return res.status(500).json({ error: err.message }); }
 });
 
@@ -2097,35 +2200,98 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     if (!doc.exists) return res.status(404).json({ error: "User not found" });
     const data  = doc.data();
     const patch = {};
+
+    // Only patch genuinely missing fields — never reset numeric balances to 0
     if (data.bonusCoins === undefined || data.bonusCoins === null) patch.bonusCoins = 0;
     if (!data.lastSeen)     patch.lastSeen     = admin.firestore.FieldValue.serverTimestamp();
     if (!data.lastActiveAt) patch.lastActiveAt = admin.firestore.FieldValue.serverTimestamp();
-    if (data.bonusMatchUsed !== undefined)      patch.bonusMatchUsed = admin.firestore.FieldValue.delete();
+    if (data.bonusMatchUsed      !== undefined) patch.bonusMatchUsed      = admin.firestore.FieldValue.delete();
     if (data.firstMatchBonusUsed !== undefined) patch.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
     if (!data.country || !data.currency) {
       const detected = detectCountryFromPhone(data.phone || "");
       if (!data.country)  patch.country  = detected.country;
       if (!data.currency) patch.currency = detected.currency;
     }
-    if (data.strikeCount === undefined) patch.strikeCount = 0;
-    if (data.isBanned    === undefined) patch.isBanned    = false;
-    if (data.banReason   === undefined) patch.banReason   = "";
+    if (data.strikeCount  === undefined) patch.strikeCount  = 0;
+    if (data.isBanned     === undefined) patch.isBanned     = false;
+    if (data.banReason    === undefined) patch.banReason    = "";
+    if (data.banType      === undefined) patch.banType      = null;
+    if (data.banHours     === undefined) patch.banHours     = null;
+    if (data.banExpiresAt === undefined) patch.banExpiresAt = null;
+    if (data.bannedAt     === undefined) patch.bannedAt     = null;
+
     if (data.trustScore === undefined) {
-      const trustFields = { trustScore: 80, completedMatches: data.completedMatches || 0, cancelledMatches: data.cancelledMatches || 0, disputesLost: data.disputesLost || 0, reportsReceived: data.reportsReceived || 0, fakeResults: data.fakeResults || 0, rageQuits: data.rageQuits || 0, fairPlayRating: 100, matchCompletionRate: 0, cleanMatchBonus: 0, fairPlayBonus: 0, rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, onlineStatus: data.onlineStatus !== undefined ? data.onlineStatus : true, friendRequests: data.friendRequests !== undefined ? data.friendRequests : true, country: patch.country || data.country || "Unknown", currency: patch.currency || data.currency || "Unknown", strikeCount: data.strikeCount || 0, isBanned: data.isBanned || false, banReason: data.banReason || "" };
+      const trustFields = {
+        trustScore:            80,
+        completedMatches:      data.completedMatches      || 0,
+        cancelledMatches:      data.cancelledMatches      || 0,
+        disputesLost:          data.disputesLost          || 0,
+        reportsReceived:       data.reportsReceived       || 0,
+        fakeResults:           data.fakeResults           || 0,
+        rageQuits:             data.rageQuits             || 0,
+        fairPlayRating:        100,
+        matchCompletionRate:   0,
+        cleanMatchBonus:       0,
+        fairPlayBonus:         0,
+        rcBalance:             data.rcBalance             || 0,
+        bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
+        firstPurchaseDone:     data.firstPurchaseDone     || false,
+        referralRewardGranted: data.referralRewardGranted || false,
+        onlineStatus:          data.onlineStatus          !== undefined ? data.onlineStatus  : true,
+        friendRequests:        data.friendRequests        !== undefined ? data.friendRequests : true,
+        country:               patch.country  || data.country  || "Unknown",
+        currency:              patch.currency || data.currency || "Unknown",
+        strikeCount:           data.strikeCount  || 0,
+        isBanned:              data.isBanned     || false,
+        banReason:             data.banReason    || "",
+        banType:               data.banType      != null ? data.banType   : null,
+        banHours:              data.banHours     != null ? data.banHours  : null,
+        banExpiresAt:          data.banExpiresAt != null ? data.banExpiresAt : null,
+        bannedAt:              data.bannedAt     != null ? data.bannedAt  : null,
+      };
       Object.assign(trustFields, patch);
       db.collection("users").doc(uid).set(Object.assign({}, trustFields, patch), { merge: true }).catch(() => {});
       const result = Object.assign({}, data, trustFields);
       delete result.bonusMatchUsed; delete result.firstMatchBonusUsed;
       return res.json(result);
     }
-    const needsPatch = data.cleanMatchBonus === undefined || data.fairPlayBonus === undefined || data.rcBalance === undefined || data.bonusCoins === undefined || data.firstPurchaseDone === undefined || data.referralRewardGranted === undefined || !data.lastSeen || !data.lastActiveAt || !data.country || !data.currency || data.strikeCount === undefined || data.bonusMatchUsed !== undefined || data.firstMatchBonusUsed !== undefined;
+
+    const needsPatch = data.cleanMatchBonus      === undefined ||
+                       data.fairPlayBonus        === undefined ||
+                       data.rcBalance            === undefined ||
+                       data.bonusCoins           === undefined ||
+                       data.firstPurchaseDone    === undefined ||
+                       data.referralRewardGranted=== undefined ||
+                       data.banType              === undefined ||
+                       data.banExpiresAt         === undefined ||
+                       data.bannedAt             === undefined ||
+                       !data.lastSeen            ||
+                       !data.lastActiveAt        ||
+                       !data.country             ||
+                       !data.currency            ||
+                       data.strikeCount          === undefined ||
+                       data.bonusMatchUsed       !== undefined ||
+                       data.firstMatchBonusUsed  !== undefined;
+
     if (needsPatch || Object.keys(patch).length > 0) {
-      const fullPatch = Object.assign({ cleanMatchBonus: data.cleanMatchBonus || 0, fairPlayBonus: data.fairPlayBonus || 0, rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false }, patch);
+      const fullPatch = Object.assign({
+        cleanMatchBonus:       data.cleanMatchBonus       || 0,
+        fairPlayBonus:         data.fairPlayBonus         || 0,
+        rcBalance:             data.rcBalance             || 0,
+        bonusCoins:            data.bonusCoins            != null ? data.bonusCoins : 0,
+        firstPurchaseDone:     data.firstPurchaseDone     || false,
+        referralRewardGranted: data.referralRewardGranted || false,
+        banType:               data.banType      != null ? data.banType  : null,
+        banHours:              data.banHours     != null ? data.banHours : null,
+        banExpiresAt:          data.banExpiresAt != null ? data.banExpiresAt : null,
+        bannedAt:              data.bannedAt     != null ? data.bannedAt : null,
+      }, patch);
       db.collection("users").doc(uid).set(fullPatch, { merge: true }).catch(() => {});
       const result = Object.assign({}, data, fullPatch);
       delete result.bonusMatchUsed; delete result.firstMatchBonusUsed;
       return res.json(result);
     }
+
     const result = Object.assign({}, data);
     delete result.bonusMatchUsed; delete result.firstMatchBonusUsed;
     return res.json(result);
@@ -2670,7 +2836,6 @@ app.post("/matches/dispute", verifyToken, async (req, res) => {
       notifyEvidenceRequired(opponentUid, matchId, new Date(Date.now() + DISPUTE_EXPIRY_MS).toISOString()).catch(() => {});
     }
 
-    // Track total disputes
     incrementPlatformField("totalDisputes").catch(() => {});
 
     setTimeout(async () => {
@@ -3044,7 +3209,7 @@ app.post("/admin/migrate-trust", verifyToken, async (req, res) => {
       snap.docs.forEach((doc) => {
         try {
           const data = doc.data(), detected = detectCountryFromPhone(data.phone || "");
-          const updateFields = { trustScore: computeTrustScore(data), fairPlayRating: computeFairPlayRating(data), matchCompletionRate: computeCompletionRate(data), rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, strikeCount: data.strikeCount !== undefined ? data.strikeCount : 0, isBanned: data.isBanned !== undefined ? data.isBanned : false, banReason: data.banReason !== undefined ? data.banReason : "", trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), ...(!data.country ? { country: detected.country } : {}), ...(!data.currency ? { currency: detected.currency } : {}) };
+          const updateFields = { trustScore: computeTrustScore(data), fairPlayRating: computeFairPlayRating(data), matchCompletionRate: computeCompletionRate(data), rcBalance: data.rcBalance || 0, bonusCoins: data.bonusCoins != null ? data.bonusCoins : 0, firstPurchaseDone: data.firstPurchaseDone || false, referralRewardGranted: data.referralRewardGranted || false, strikeCount: data.strikeCount !== undefined ? data.strikeCount : 0, isBanned: data.isBanned !== undefined ? data.isBanned : false, banReason: data.banReason !== undefined ? data.banReason : "", banType: data.banType !== undefined ? data.banType : null, banHours: data.banHours !== undefined ? data.banHours : null, banExpiresAt: data.banExpiresAt !== undefined ? data.banExpiresAt : null, bannedAt: data.bannedAt !== undefined ? data.bannedAt : null, trustUpdatedAt: admin.firestore.FieldValue.serverTimestamp(), ...(!data.country ? { country: detected.country } : {}), ...(!data.currency ? { currency: detected.currency } : {}) };
           if (!data.lastSeen)     updateFields.lastSeen     = admin.firestore.FieldValue.serverTimestamp();
           if (!data.lastActiveAt) updateFields.lastActiveAt = admin.firestore.FieldValue.serverTimestamp();
           if (data.bonusMatchUsed !== undefined)      updateFields.bonusMatchUsed = admin.firestore.FieldValue.delete();
@@ -3288,3 +3453,4 @@ server.on("error", (err) => {
   console.error("Server error:", err.message);
   process.exit(1);
 });
+

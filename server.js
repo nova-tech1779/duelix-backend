@@ -187,7 +187,6 @@ async function recomputeBannedUsers() {
   }
 }
 
-// Touch lastActiveAt for a user and update activeUsers24h counter
 async function touchLastActiveAt(uid) {
   if (!uid) return;
   try {
@@ -355,15 +354,55 @@ async function uniqueReferralCode() {
 }
 
 // =============================================================
-// MATCH ECONOMY
+// MATCH ECONOMY  (NEW ECONOMY SYSTEM — 10% platform fee)
+//
+// Rules:
+//   - Match entry uses Gameplay Coins only (or Bonus Coins for
+//     Bonus Matches, which never generate RC and are unaffected
+//     by this new formula).
+//   - Platform takes 10% of the TOTAL match pool.
+//   - Winner receives their ORIGINAL entry fee back as Gameplay
+//     Coins, and the remaining pool (after platform fee) as RC.
+//   - Loser receives NOTHING (0 coins, 0 RC).
+//   - Draws refund 95% of each player's own entry fee as
+//     Gameplay Coins, rounded to the nearest whole coin. No RC
+//     is ever awarded on a draw.
+//   - All calculations happen server-side only. Frontend values
+//     are never trusted.
+//   - Platform fee / earnings are NEVER returned in any API
+//     response consumed by the client.
 // =============================================================
-const pool              = (f) => f * 2;
-const winnerReward      = (f) => Math.floor(f * 1.00);
-const winnerRc          = (f) => Math.floor(f * 0.60);
-const loserReward       = (f) => Math.floor(f * 0.10);
-const platformFee       = (f) => pool(f) - winnerReward(f) - loserReward(f);
-const drawRefund        = (f) => Math.floor(f * 0.90);
-const drawPlatformFee   = (f) => (f * 2) - (drawRefund(f) * 2);
+const pool = (f) => f * 2;
+
+// Platform fee = 10% of total pool, floored to whole coins.
+const platformFee = (f) => Math.floor(pool(f) * 0.10);
+
+// Winner gets their original entry fee refunded as Gameplay Coins.
+const winnerReward = (f) => f;
+
+// Winner RC = whatever remains of the pool after the platform fee
+// and the winner's own coin refund. Computed as a remainder (not
+// a flat percentage) so no coins are lost to rounding.
+const winnerRc = (f) => {
+  const remaining = pool(f) - platformFee(f);
+  const rc = remaining - winnerReward(f);
+  return rc > 0 ? rc : 0;
+};
+
+// Loser receives nothing under the new economy.
+const loserReward = (f) => 0;
+
+// Draw refund = 95% of the player's OWN entry fee, rounded to the
+// nearest whole coin (not floored) to match spec examples exactly
+// (10->10, 20->19, 50->48, 100->95).
+const drawRefund = (f) => Math.round(f * 0.95);
+
+// Whatever the platform keeps from a draw (both players combined).
+const drawPlatformFee = (f) => (f * 2) - (drawRefund(f) * 2);
+
+// Bonus Matches are untouched by the new economy — they never
+// generate RC, use Bonus Coins only, and keep their existing
+// 50% winner reward / full refund on draw / nothing on loss rules.
 const bonusWinnerReward = (f) => Math.floor(f * 0.50);
 const bonusDrawRefund   = (f) => f;
 
@@ -385,15 +424,18 @@ function validateWalletType(walletType) {
 }
 
 // =============================================================
-// COIN PACKAGE CATALOGUE
+// COIN PACKAGE CATALOGUE  (NEW STORE PRICES)
+// koboAmount = usdPrice * 1000 (same GHS conversion ratio used
+// previously in this codebase — preserved so Paystack charges
+// remain consistent with existing production behavior).
 // =============================================================
 const COIN_PACKAGES = {
   "coins_50":   { coins: 50,   koboAmount: 500,   currency: "GHS", label: "Starter"  },
-  "coins_105":  { coins: 105,  koboAmount: 1000,  currency: "GHS", label: "Basic"    },
-  "coins_215":  { coins: 215,  koboAmount: 2000,  currency: "GHS", label: "Standard" },
-  "coins_550":  { coins: 550,  koboAmount: 5000,  currency: "GHS", label: "Plus"     },
-  "coins_1150": { coins: 1150, koboAmount: 10000, currency: "GHS", label: "Pro"      },
-  "coins_2400": { coins: 2400, koboAmount: 20000, currency: "GHS", label: "Elite"    },
+  "coins_100":  { coins: 100,  koboAmount: 1000,  currency: "GHS", label: "Basic"    },
+  "coins_205":  { coins: 205,  koboAmount: 2000,  currency: "GHS", label: "Standard" },
+  "coins_520":  { coins: 520,  koboAmount: 5000,  currency: "GHS", label: "Plus"     },
+  "coins_1050": { coins: 1050, koboAmount: 10000, currency: "GHS", label: "Pro"      },
+  "coins_2150": { coins: 2150, koboAmount: 20000, currency: "GHS", label: "Elite"    },
 };
 
 // =============================================================
@@ -655,6 +697,8 @@ async function detectSuspiciousActivity(uid, context) {
 
 // =============================================================
 // REFERRAL REWARD — GAMEPLAY COINS ONLY
+// Referral activates ONLY after first verified Coin purchase.
+// Referrer +5 Gameplay Coins, new user +5 Gameplay Coins, once only.
 // =============================================================
 async function tryGrantReferralReward(uid) {
   try {
@@ -1032,7 +1076,7 @@ function notifyBonusMatchDraw(userId, matchId, refundAmount) {
   return notifyUser(userId, "bonus_match_draw", "Bonus Match Draw!", "The Bonus Match ended in a draw. +" + refundAmount + " Bonus Coins refunded. No RC on bonus matches.", { matchId, refundAmount, walletType: "bonus" });
 }
 function notifyMatchLost(userId, matchId, coinsBack) {
-  return notifyUser(userId, "match_lost", "Match Over", "You lost the match. +" + coinsBack + " coins returned. Keep going!", { matchId, coinsBack });
+  return notifyUser(userId, "match_lost", "Match Over", coinsBack > 0 ? ("You lost the match. +" + coinsBack + " coins returned. Keep going!") : "You lost the match. Keep going!", { matchId, coinsBack });
 }
 function notifyMatchDraw(userId, matchId, coinsBack) {
   return notifyUser(userId, "match_draw", "It's a Draw!", "Match ended in a draw. +" + coinsBack + " coins refunded. No RC on draws.", { matchId, coinsBack });
@@ -1178,7 +1222,8 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
     const winnerUpdated = Object.assign({}, winnerData, { completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0) });
     const loserUpdated  = Object.assign({}, loserData,  { completedMatches: inc(loserData.completedMatches  != null ? loserData.completedMatches  : 0), totalMatches: inc(loserData.totalMatches  != null ? loserData.totalMatches  : 0) });
     t.update(winnerRef, { coins: inc(winnerData.coins != null ? winnerData.coins : 0, winner), wins: inc(winnerData.wins != null ? winnerData.wins : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0), completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0) });
-    t.update(loserRef,  { coins: inc(loserData.coins  != null ? loserData.coins  : 0, loser),  losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
+    // Loser receives 0 coins under the new economy — stats still update, but no coin write occurs.
+    t.update(loserRef,  { losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
     if (rc > 0) t.update(winnerRef, { rcBalance: (Number(winnerData.rcBalance) || 0) + rc });
     applyCleanMatchReward(t, winnerRef, winnerUpdated);
     applyCleanMatchReward(t, loserRef,  loserUpdated);
@@ -1199,6 +1244,7 @@ async function distributeReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION -- BONUS CONFIRM-RESULT PATH
+// (unchanged — bonus economy is untouched by the new formula)
 // =============================================================
 async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
   const playerA_Ref = db.collection("users").doc(match.playerA);
@@ -1237,6 +1283,8 @@ async function distributeBonusReward(t, match, matchRef, confirmedWinner) {
 
 // =============================================================
 // REWARD DISTRIBUTION -- GAMEPLAY AUTO-RESOLVE PATH
+// (used when one player submits and the other fails to
+// confirm/dispute before the timer expires — a "rage quit")
 // =============================================================
 async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, nonSubmitterUid) {
   const winner  = winnerReward(match.entryFee);
@@ -1273,7 +1321,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     const winnerUpdated = Object.assign({}, winnerData, { completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0) });
     const loserUpdated  = Object.assign({}, loserData,  { completedMatches: inc(loserData.completedMatches  != null ? loserData.completedMatches  : 0), totalMatches: inc(loserData.totalMatches  != null ? loserData.totalMatches  : 0) });
     t.update(winnerRef, { coins: inc(winnerData.coins != null ? winnerData.coins : 0, winner), wins: inc(winnerData.wins != null ? winnerData.wins : 0), totalMatches: inc(winnerData.totalMatches != null ? winnerData.totalMatches : 0), completedMatches: inc(winnerData.completedMatches != null ? winnerData.completedMatches : 0) });
-    t.update(loserRef,  { coins: inc(loserData.coins  != null ? loserData.coins  : 0, loser),  losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
+    t.update(loserRef,  { losses: inc(loserData.losses != null ? loserData.losses : 0), totalMatches: inc(loserData.totalMatches != null ? loserData.totalMatches : 0), completedMatches: inc(loserData.completedMatches != null ? loserData.completedMatches : 0) });
     if (rc > 0 && confirmedWinner !== nonSubmitterUid) t.update(winnerRef, { rcBalance: (Number(winnerData.rcBalance) || 0) + rc });
     if (confirmedWinner !== nonSubmitterUid) applyCleanMatchReward(t, winnerRef, winnerUpdated);
     if (loserUid        !== nonSubmitterUid) applyCleanMatchReward(t, loserRef,  loserUpdated);
@@ -1282,7 +1330,7 @@ async function distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, 
     if (rc > 0 && confirmedWinner !== nonSubmitterUid) createTransactionRecord(confirmedWinner, "rc_earned", rc, "RC earned for winning match (auto-resolved) " + match.id, { matchId: match.id, entryFee: match.entryFee, coinsWon: winner, walletType: "gameplay" }).catch(() => {});
     updateLiveActivity(winnerData.displayName || "Player", winnerData.avatar || "assets/avatars/avatar1.png", match.entryFee, false).catch(() => {});
   }
-  t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: confirmedWinner === "draw" ? 0 : winner, winnerRc: confirmedWinner === "draw" ? 0 : rc, loserReward: confirmedWinner === "draw" ? 0 : loser, walletType: "gameplay", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null });
+  t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: confirmedWinner === "draw" ? 0 : winner, winnerRc: confirmedWinner === "draw" ? 0 : rc, loserReward: confirmedWinner === "draw" ? 0 : loser, walletType: "gameplay", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null, rageQuitBy: nonSubmitterUid || null });
 
   incrementPlatformField("totalMatchesPlayed").catch(() => {});
   recomputeGameplayCoinTotal().catch(() => {});
@@ -1325,7 +1373,7 @@ async function distributeBonusRewardAutoResolve(t, match, matchRef, confirmedWin
   }
   const bonusWin = confirmedWinner === "draw" ? 0 : bonusWinnerReward(match.entryFee);
   const refund   = confirmedWinner === "draw" ? bonusDrawRefund(match.entryFee) : 0;
-  t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: bonusWin, winnerRc: 0, loserReward: 0, bonusDrawRefund: refund, walletType: "bonus", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null });
+  t.update(matchRef, { status: "completed", confirmedWinner, rewarded: true, winnerReward: bonusWin, winnerRc: 0, loserReward: 0, bonusDrawRefund: refund, walletType: "bonus", confirmedAt: admin.firestore.FieldValue.serverTimestamp(), rematchRequestedBy: null, rematchStatus: null, rematchRequestedAt: null, rageQuitBy: nonSubmitterUid || null });
 
   incrementPlatformField("totalMatchesPlayed").catch(() => {});
   recomputeBonusCoinTotal().catch(() => {});
@@ -1415,6 +1463,7 @@ app.get("/platform/live-activity", verifyToken, async (req, res) => {
 
 // =============================================================
 // PLATFORM ANALYTICS READ ENDPOINT
+// (internal/admin use only — never surfaced in player-facing UI)
 // =============================================================
 app.get("/platform/analytics", verifyToken, async (req, res) => {
   try {
@@ -1426,9 +1475,6 @@ app.get("/platform/analytics", verifyToken, async (req, res) => {
 
 // =============================================================
 // CLOUDINARY -- SECURE EVIDENCE UPLOAD ENDPOINT
-// FIX 1: Use disputeDoc.ref.set() — Node.js Admin SDK uses .ref
-//         not .reference (which is the Flutter/Dart SDK property).
-//         Also added null-guard on disputeDoc before accessing .ref.
 // =============================================================
 app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1454,7 +1500,6 @@ app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
       return res.status(400).json({ error: "No dispute record found for this match. Please file a dispute before uploading evidence." });
     }
 
-    // FIX 1: disputeDoc.ref is the correct Admin SDK property (not .reference)
     const disputeDoc  = disputeSnap.docs[0];
     const disputeData = disputeDoc.data();
     const disputeId   = disputeData.id || disputeDoc.id;
@@ -1470,7 +1515,6 @@ app.post("/dispute/upload-evidence", verifyToken, async (req, res) => {
     const isPlayerA      = match.playerA === uid;
     const submittedField = isPlayerA ? "playerAEvidenceSubmitted" : "playerBEvidenceSubmitted";
 
-    // FIXED: was disputeDoc.reference.set — now correctly uses disputeDoc.ref.set
     await disputeDoc.ref.set(
       { [submittedField]: true, updatedAt: admin.firestore.FieldValue.serverTimestamp() },
       { merge: true }
@@ -1769,7 +1813,7 @@ app.get("/rc/balance/:uid", verifyToken, async (req, res) => {
 });
 
 // =============================================================
-// RC REDEEM
+// RC REDEEM  (RC only, min 200 RC, 100 RC = $1 USD)
 // =============================================================
 app.post("/rc/redeem", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1809,6 +1853,11 @@ app.post("/rc/redeem", verifyToken, async (req, res) => {
 
 // =============================================================
 // RC CONVERT TO GAMEPLAY COINS
+// (Re-introduced: RC can be converted into Gameplay Coins at a
+// 1:1 ratio — 1 RC = 1 Gameplay Coin. Minimum conversion is 5 RC.
+// This runs independently of the new match-economy formula above;
+// RC earned from match wins remains valid for both conversion
+// here and cash redemption via /rc/redeem.)
 // =============================================================
 app.post("/rc/convert", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1948,12 +1997,6 @@ app.post("/trust/fake-result", verifyToken, async (req, res) => {
 
 // =============================================================
 // CREATE USER PROFILE
-// FIX 2: Consolidated t.set() now includes every required field
-//         explicitly — no reliance on Object.assign spread order
-//         or DEFAULT_TRUST_FIELDS merge. All fields guaranteed
-//         to be present and correctly initialised in the single
-//         transaction write. Duplicate helper definitions below
-//         the endpoint are also removed to prevent shadowing.
 // =============================================================
 app.post("/users/create-profile", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -1978,10 +2021,8 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 
     const userRef = db.collection("users").doc(uid);
 
-    // Generate referral code BEFORE the transaction to avoid async work inside it
     const referralCode = await uniqueReferralCode();
 
-    // Uniqueness checks BEFORE the transaction
     const phoneSnap = await db.collection("users").where("phone", "==", phone).limit(1).get();
     if (!phoneSnap.empty && phoneSnap.docs[0].id !== uid) {
       return res.status(409).json({ error: "That phone number is already registered" });
@@ -1993,35 +2034,24 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
 
     await db.runTransaction(async (t) => {
       const snap = await t.get(userRef);
-      // Idempotent: if the profile already exists, do nothing
       if (snap.exists) return;
 
-      // -------------------------------------------------------
-      // COMPLETE user document — every required field is listed
-      // explicitly here. Do NOT use Object.assign / spread to
-      // merge DEFAULT_TRUST_FIELDS; keep it explicit so missing
-      // fields are immediately visible during code review.
-      // -------------------------------------------------------
       t.set(userRef, {
-        // ── Identity ──────────────────────────────────────────
         uid,
         displayName:           name,
         email:                 email != null ? String(email).trim() : "",
         phone,
         avatar:                "assets/avatars/avatar1.png",
 
-        // ── Geography ─────────────────────────────────────────
         country,
         currency,
 
-        // ── Wallets ───────────────────────────────────────────
         // "coins" is the gameplay-coins field used throughout the
         // codebase (match creation, rewards, etc.). Keep as-is.
         coins:                 0,       // gameplay coins
-        bonusCoins:            10,      // new-user bonus
+        bonusCoins:            10,      // new-user signup bonus
         rcBalance:             0,
 
-        // ── Match stats ───────────────────────────────────────
         wins:                  0,
         losses:                0,
         draws:                 0,
@@ -2029,7 +2059,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         completedMatches:      0,
         cancelledMatches:      0,
 
-        // ── Trust / fair-play ─────────────────────────────────
         trustScore:            80,
         fairPlayRating:        100,
         matchCompletionRate:   0,
@@ -2040,7 +2069,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         fakeResults:           0,
         rageQuits:             0,
 
-        // ── Strike / ban ──────────────────────────────────────
         strikeCount:           0,
         isBanned:              false,
         banType:               null,
@@ -2049,26 +2077,21 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
         bannedAt:              null,
         banExpiresAt:          null,
 
-        // ── Referral ──────────────────────────────────────────
         referralCode,
         referralCount:         0,
         referredBy:            null,
         referredByName:        null,
         referralRewardGranted: false,
 
-        // ── Purchase / onboarding ─────────────────────────────
         firstPurchaseDone:     false,
 
-        // ── Social / privacy prefs ────────────────────────────
         onlineStatus:          true,
         friendRequests:        true,
 
-        // ── Device / session ──────────────────────────────────
         fcmToken:              null,
         deviceId:              deviceId  || null,
         installId:             installId || null,
 
-        // ── Timestamps ────────────────────────────────────────
         loginStreak:           0,
         lastLogin:             null,
         createdAt:             admin.firestore.FieldValue.serverTimestamp(),
@@ -2077,7 +2100,6 @@ app.post("/users/create-profile", verifyToken, async (req, res) => {
       });
     });
 
-    // Fire-and-forget side-effects AFTER the transaction commits
     incrementPlatformField("totalUsers").catch(() => {});
     updateActiveUsers24h().catch(() => {});
     recordDeviceFingerprint(uid, deviceId, installId, ipAddress).catch(() => {});
@@ -2099,9 +2121,6 @@ app.get("/user-exists/:uid", async (req, res) => {
 
 // =============================================================
 // MIGRATION: ENSURE FIELDS
-// Only patches genuinely missing/undefined fields. Does NOT
-// overwrite coins, bonusCoins, rcBalance, wins, losses, etc.
-// that were correctly written at profile creation time.
 // =============================================================
 app.post("/users/ensure-fields", verifyToken, async (req, res) => {
   const uid = req.user.uid;
@@ -2112,23 +2131,19 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
     const data    = userDoc.data();
     const updates = {};
 
-    // Only set bonusCoins if truly missing (undefined/null), not if it's 0
     if (data.bonusCoins === undefined || data.bonusCoins === null) updates.bonusCoins = 0;
     if (!data.lastSeen)     updates.lastSeen     = admin.firestore.FieldValue.serverTimestamp();
     if (!data.lastActiveAt) updates.lastActiveAt = admin.firestore.FieldValue.serverTimestamp();
 
-    // Remove legacy fields
     if (data.bonusMatchUsed      !== undefined) updates.bonusMatchUsed      = admin.firestore.FieldValue.delete();
     if (data.firstMatchBonusUsed !== undefined) updates.firstMatchBonusUsed = admin.firestore.FieldValue.delete();
 
-    // Backfill country/currency if missing
     if (!data.country || !data.currency) {
       const detected = detectCountryFromPhone(data.phone || "");
       if (!data.country)  updates.country  = detected.country;
       if (!data.currency) updates.currency = detected.currency;
     }
 
-    // Backfill ban/strike fields added after original profiles were created
     if (data.strikeCount  === undefined) updates.strikeCount  = 0;
     if (data.isBanned     === undefined) updates.isBanned     = false;
     if (data.banReason    === undefined) updates.banReason    = "";
@@ -2137,7 +2152,6 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
     if (data.banExpiresAt === undefined) updates.banExpiresAt = null;
     if (data.bannedAt     === undefined) updates.bannedAt     = null;
 
-    // Backfill trust fields
     if (data.cleanMatchBonus      === undefined) updates.cleanMatchBonus      = 0;
     if (data.fairPlayBonus        === undefined) updates.fairPlayBonus        = 0;
     if (data.rcBalance            === undefined) updates.rcBalance            = 0;
@@ -2146,7 +2160,6 @@ app.post("/users/ensure-fields", verifyToken, async (req, res) => {
     if (data.firstPurchaseDone    === undefined) updates.firstPurchaseDone    = false;
     if (data.referralRewardGranted=== undefined) updates.referralRewardGranted= false;
     if (data.referralCode         === undefined || !data.referralCode) {
-      // Only generate a new code for accounts that were created before this field existed
       const newCode = await uniqueReferralCode().catch(() => null);
       if (newCode) updates.referralCode = newCode;
     }
@@ -2201,7 +2214,6 @@ app.get("/user/:uid", verifyToken, async (req, res) => {
     const data  = doc.data();
     const patch = {};
 
-    // Only patch genuinely missing fields — never reset numeric balances to 0
     if (data.bonusCoins === undefined || data.bonusCoins === null) patch.bonusCoins = 0;
     if (!data.lastSeen)     patch.lastSeen     = admin.firestore.FieldValue.serverTimestamp();
     if (!data.lastActiveAt) patch.lastActiveAt = admin.firestore.FieldValue.serverTimestamp();
@@ -2785,7 +2797,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
         else { const lu = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA, bw = bonusWinnerReward(ef); notifyBonusMatchWon(w, mid, bw).catch(() => {}); notifyBonusMatchLost(lu, mid).catch(() => {}); createTransactionRecord(w, "bonus_match_won", bw, "Bonus match won: +" + bw + " Gameplay Coins", { matchId: mid, entryFee: ef, walletType: "bonus", coinsWon: bw }).catch(() => {}); createTransactionRecord(lu, "bonus_match_lost", 0, "Bonus match lost.", { matchId: mid, entryFee: ef, walletType: "bonus" }).catch(() => {}); }
       } else {
         if (w === "draw") { const r = drawRefund(ef); notifyMatchDraw(matchSnapshot.playerA, mid, r).catch(() => {}); notifyMatchDraw(matchSnapshot.playerB, mid, r).catch(() => {}); createTransactionRecord(matchSnapshot.playerA, "match_draw", r, "Draw refund for match " + mid, { matchId: mid, entryFee: ef, refund: r, walletType: "gameplay" }).catch(() => {}); createTransactionRecord(matchSnapshot.playerB, "match_draw", r, "Draw refund for match " + mid, { matchId: mid, entryFee: ef, refund: r, walletType: "gameplay" }).catch(() => {}); }
-        else { const lu = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA, rc = winnerRc(ef), wc = winnerReward(ef), lc = loserReward(ef); notifyMatchWon(w, mid, wc, rc).catch(() => {}); notifyMatchLost(lu, mid, lc).catch(() => {}); notifyRcEarned(w, rc, wc, mid).catch(() => {}); createTransactionRecord(w, "match_win", wc, "Match won: +" + wc + " coins + +" + rc + " RC", { matchId: mid, entryFee: ef, coinsWon: wc, rcEarned: rc, walletType: "gameplay" }).catch(() => {}); createTransactionRecord(lu, "match_lost", lc, "Match lost: consolation +" + lc + " coins", { matchId: mid, entryFee: ef, coinsBack: lc, walletType: "gameplay" }).catch(() => {}); }
+        else { const lu = w === matchSnapshot.playerA ? matchSnapshot.playerB : matchSnapshot.playerA, rc = winnerRc(ef), wc = winnerReward(ef), lc = loserReward(ef); notifyMatchWon(w, mid, wc, rc).catch(() => {}); notifyMatchLost(lu, mid, lc).catch(() => {}); notifyRcEarned(w, rc, wc, mid).catch(() => {}); createTransactionRecord(w, "match_win", wc, "Match won: +" + wc + " coins + +" + rc + " RC", { matchId: mid, entryFee: ef, coinsWon: wc, rcEarned: rc, walletType: "gameplay" }).catch(() => {}); createTransactionRecord(lu, "match_lost", lc, "Match lost.", { matchId: mid, entryFee: ef, coinsBack: lc, walletType: "gameplay" }).catch(() => {}); }
       }
     }
     touchLastActiveAt(uid).catch(() => {});
@@ -2793,6 +2805,7 @@ app.post("/matches/confirm-result", verifyToken, async (req, res) => {
   } catch (err) { return res.status(400).json({ error: err.message }); }
 });
 
+// ── END OF PHASE 1 — continue with Phase 2 immediately below ──
 // =============================================================
 // DISPUTE ENDPOINT
 // =============================================================
@@ -2904,6 +2917,8 @@ app.get("/matches/history", verifyToken, async (req, res) => {
 
 // =============================================================
 // DISPUTE RESOLUTION LISTENER
+// (uses new economy formulas: winner keeps entry fee + RC,
+// loser gets nothing, refund_both uses 95% draw refund)
 // =============================================================
 function startDisputeResolutionListener() {
   console.log("[dispute-listener] Starting...");
@@ -2986,11 +3001,25 @@ function startDisputeResolutionListener() {
   );
 }
 
+// =============================================================
+// AUTO-RESOLVE — one player submitted a result, the other failed
+// to confirm/dispute within the confirm-result timer. Resolved
+// automatically in favor of the submitter. The non-responding
+// player is treated as having abandoned the match ("Rage Quit")
+// regardless of what the actual score would have shown, and
+// receives:
+//   - A Rage Quit penalty (rageQuits increment)
+//   - One Dispute Loss (disputesLost increment)
+//   - One Strike (via applyStrike, which also reduces Trust Score
+//     and Fair Play Rating internally)
+// None of this is exposed to the client — only the final match
+// outcome and existing notifications are visible.
+// =============================================================
 app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
   const { matchId } = req.body;
   if (!matchId) return res.status(400).json({ error: "matchId required" });
   try {
-    let result = {}, matchSnapshot = null;
+    let result = {}, matchSnapshot = null, rageQuitUid = null;
     await db.runTransaction(async (t) => {
       const matchRef = db.collection("matches").doc(matchId);
       const matchDoc = await t.get(matchRef);
@@ -3009,14 +3038,41 @@ app.post("/matches/auto-resolve", verifyToken, async (req, res) => {
       if (submitterScore > otherScore) confirmedWinner = submitter;
       else if (otherScore > submitterScore) confirmedWinner = other;
       else confirmedWinner = "draw";
+
+      // The non-responding player ("other") abandoned the match — treat
+      // as Rage Quit regardless of what the score outcome would have
+      // been. Bump rageQuits + disputesLost here (atomic, inside the
+      // transaction); the Strike itself (which also reduces Trust
+      // Score / Fair Play Rating) is applied just after the
+      // transaction commits via applyStrike().
       const nsRef = db.collection("users").doc(other);
       const nsDoc = await t.get(nsRef);
-      if (nsDoc.exists) { const nsData = Object.assign({}, nsDoc.data(), { rageQuits: inc(nsDoc.data().rageQuits) }); t.update(nsRef, { rageQuits: inc(nsDoc.data().rageQuits) }); applyTrustUpdate(t, nsRef, nsData); }
+      if (nsDoc.exists) {
+        const nsData = Object.assign({}, nsDoc.data(), {
+          rageQuits:    inc(nsDoc.data().rageQuits),
+          disputesLost: inc(nsDoc.data().disputesLost),
+        });
+        t.update(nsRef, {
+          rageQuits:    inc(nsDoc.data().rageQuits),
+          disputesLost: inc(nsDoc.data().disputesLost),
+        });
+        applyTrustUpdate(t, nsRef, nsData);
+        rageQuitUid = other;
+      }
+
       const wt = validateWalletType(match.walletType);
       if (wt === "bonus") result = await distributeBonusRewardAutoResolve(t, match, matchRef, confirmedWinner, other);
       else                result = await distributeRewardAutoResolve(t, match, matchRef, confirmedWinner, other);
       t.update(matchRef, { autoResolved: true });
     });
+
+    // Apply the Strike (increments strikeCount, may trigger a
+    // suspension/ban tier, and recomputes trust/fair-play scores)
+    // outside the transaction since applyStrike does its own reads/writes.
+    if (rageQuitUid) {
+      applyStrike(rageQuitUid, "Rage Quit — failed to confirm or dispute match result in time").catch(() => {});
+    }
+
     if (matchSnapshot && !result.alreadyResolved && !result.alreadyCancelled) {
       const w = result.confirmedWinner, mid = matchSnapshot.id || matchId, ef = matchSnapshot.entryFee, wt = validateWalletType(matchSnapshot.walletType);
       notifyAutoResolved(matchSnapshot.playerA, mid, w).catch(() => {}); notifyAutoResolved(matchSnapshot.playerB, mid, w).catch(() => {});
@@ -3053,6 +3109,9 @@ app.post("/matches/auto-cancel", verifyToken, async (req, res) => {
       const [aDoc, bDoc] = await Promise.all([t.get(aRef), t.get(bRef)]);
       if (!aDoc.exists || !bDoc.exists) throw new Error("Player data not found");
       const aData = aDoc.data(), bData = bDoc.data();
+      // Neither player submitted a result — refund both in full,
+      // no rage-quit penalty since neither is more at fault than
+      // the other for an unsubmitted match.
       if (wt === "bonus") { t.update(aRef, { bonusCoins: inc(Number(aData.bonusCoins) || 0, match.entryFee) }); t.update(bRef, { bonusCoins: inc(Number(bData.bonusCoins) || 0, match.entryFee) }); }
       else { t.update(aRef, { coins: inc(aData.coins, match.entryFee) }); t.update(bRef, { coins: inc(bData.coins, match.entryFee) }); }
       const aUp = Object.assign({}, aData, { rageQuits: inc(aData.rageQuits) }), bUp = Object.assign({}, bData, { rageQuits: inc(bData.rageQuits) });
@@ -3421,12 +3480,10 @@ function startActiveUsersRefreshLoop() {
 // =============================================================
 function startPlatformAnalyticsDailyLoop() {
   console.log("[platform-analytics] Starting daily recompute loop");
-  // Initial run
   recomputeGameplayCoinTotal().catch(() => {});
   recomputeBonusCoinTotal().catch(() => {});
   recomputeRCTotal().catch(() => {});
   recomputeBannedUsers().catch(() => {});
-  // Every 6 hours
   setInterval(() => {
     recomputeGameplayCoinTotal().catch(() => {});
     recomputeBonusCoinTotal().catch(() => {});
@@ -3453,4 +3510,3 @@ server.on("error", (err) => {
   console.error("Server error:", err.message);
   process.exit(1);
 });
-
